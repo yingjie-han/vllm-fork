@@ -761,9 +761,11 @@ class QwenVLForConditionalGeneration(QWenBaseModel, SupportsPP, SupportsLoRA,
         inputs_embeds = self.transformer.get_input_embeddings(input_ids)
 
         if multimodal_embeddings is not None:
-            inputs_embeds = merge_multimodal_embeddings(
-                input_ids, inputs_embeds, multimodal_embeddings,
-                self.transformer.visual.image_pad_id)
+            batch_size, seq_length, hidden_size = inputs_embeds.shape
+            inputs_embeds = inputs_embeds.reshape(-1,hidden_size)
+            multimodal_embeddings = multimodal_embeddings.reshape(-1,hidden_size)
+            inputs_embeds.index_put_([input_ids.reshape(-1) == self.transformer.visual.image_pad_id], multimodal_embeddings)
+            inputs_embeds = inputs_embeds.reshape(batch_size, seq_length, hidden_size)
 
         return inputs_embeds
 
