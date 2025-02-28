@@ -76,7 +76,34 @@ def _apply_rotary_emb(
     else:
         return torch.stack((o1, o2), dim=-1).flatten(-2)
 
-
+def _apply_rotary_emb_2(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    is_neox_style: bool,
+) -> torch.Tensor:
+    """
+    Args:
+        x: [num_tokens, num_heads, head_size]
+        cos: [num_tokens, head_size // 2]
+        sin: [num_tokens, head_size // 2]
+        is_neox_style: Whether to use the Neox-style or GPT-J-style rotary
+            positional embeddings.
+    """
+    cos = cos.unsqueeze(-2).to(x.dtype)
+    sin = sin.unsqueeze(-2).to(x.dtype)
+    if is_neox_style:
+        x1, x2 = torch.chunk(x, 2, dim=-1)
+    else:
+        x1 = x[..., ::2]
+        x2 = x[..., 1::2]
+    o1 = x1 * cos - x2 * sin
+    o2 = x2 * cos + x1 * sin
+    if is_neox_style:
+        return torch.cat((o1, o2), dim=-1)
+    else:
+        return torch.stack((o1, o2), dim=-1).flatten(-2)
+    
 @CustomOp.register("rotary_embedding")
 class RotaryEmbedding(CustomOp):
     """Original rotary positional embedding."""
@@ -814,6 +841,55 @@ class MRotaryEmbedding(RotaryEmbedding):
         if self.mrope_section:
             assert sum(self.mrope_section) == rotary_dim // 2
 
+    # def forward(
+    #     self,
+    #     positions: torch.Tensor,
+    #     query: torch.Tensor,
+    #     key: torch.Tensor,
+    # ) -> Tuple[torch.Tensor, torch.Tensor]:
+    #     """PyTorch-native implementation equivalent to forward().
+
+    #     Args:
+    #         positions:
+    #             [num_tokens,] (text only) or
+    #             [3, num_tokens] (T/H/W positions with multimodal inputs)
+    #         query: [num_tokens, num_heads * head_size]
+    #         key: [num_tokens, num_kv_heads * head_size]
+    #     """
+    #     assert positions.ndim == 1 or positions.ndim == 2
+
+    #     num_tokens = positions.shape[-1]
+    #     cos_sin = self.cos_sin_cache[positions]
+    #     cos, sin = cos_sin.chunk(2, dim=-1)
+    #     if positions.ndim == 2:
+    #         assert self.mrope_section
+
+    #         cos = torch.cat([
+    #             m[i]
+    #             for i, m in enumerate(cos.split(self.mrope_section, dim=-1))
+    #         ],
+    #                         dim=-1)
+    #         sin = torch.cat([
+    #             m[i]
+    #             for i, m in enumerate(sin.split(self.mrope_section, dim=-1))
+    #         ],
+    #                         dim=-1)
+
+    #     query_shape = query.shape
+    #     query = query.view(num_tokens, -1, self.head_size)
+    #     query_rot = query[..., :self.rotary_dim]
+    #     query_pass = query[..., self.rotary_dim:]
+    #     query_rot = _apply_rotary_emb(query_rot, cos, sin, self.is_neox_style)
+    #     query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
+
+    #     key_shape = key.shape
+    #     key = key.view(num_tokens, -1, self.head_size)
+    #     key_rot = key[..., :self.rotary_dim]
+    #     key_pass = key[..., self.rotary_dim:]
+    #     key_rot = _apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
+    #     key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
+    #     return query, key
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -821,7 +897,6 @@ class MRotaryEmbedding(RotaryEmbedding):
         key: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """PyTorch-native implementation equivalent to forward().
-
         Args:
             positions:
                 [num_tokens,] (text only) or
@@ -829,14 +904,14 @@ class MRotaryEmbedding(RotaryEmbedding):
             query: [num_tokens, num_heads * head_size]
             key: [num_tokens, num_kv_heads * head_size]
         """
+        if query.ndim ==3 and positions.ndim ==1:
+                 positions=positions.unsqueeze(1)
         assert positions.ndim == 1 or positions.ndim == 2
-
         num_tokens = positions.shape[-1]
         cos_sin = self.cos_sin_cache[positions]
         cos, sin = cos_sin.chunk(2, dim=-1)
-        if positions.ndim == 2:
+        if positions.ndim == 2 and query.ndim != 3:
             assert self.mrope_section
-
             cos = torch.cat([
                 m[i]
                 for i, m in enumerate(cos.split(self.mrope_section, dim=-1))
@@ -847,22 +922,28 @@ class MRotaryEmbedding(RotaryEmbedding):
                 for i, m in enumerate(sin.split(self.mrope_section, dim=-1))
             ],
                             dim=-1)
-
         query_shape = query.shape
-        query = query.view(num_tokens, -1, self.head_size)
+        if query.ndim == 3:
+            bs = query.shape[0]
+            query = query.view(bs,num_tokens, -1, self.head_size)
+        else:
+            query = query.view(num_tokens, -1, self.head_size)
         query_rot = query[..., :self.rotary_dim]
         query_pass = query[..., self.rotary_dim:]
-        query_rot = _apply_rotary_emb(query_rot, cos, sin, self.is_neox_style)
+        query_rot = _apply_rotary_emb_2(query_rot, cos, sin, self.is_neox_style)
         query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
-
         key_shape = key.shape
-        key = key.view(num_tokens, -1, self.head_size)
+        if key.ndim == 3:
+            bs = key.shape[0]
+            key = key.view(bs,num_tokens, -1, self.head_size)
+        else:
+            key = key.view(num_tokens, -1, self.head_size)
         key_rot = key[..., :self.rotary_dim]
         key_pass = key[..., self.rotary_dim:]
-        key_rot = _apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
+        key_rot = _apply_rotary_emb_2(key_rot, cos, sin, self.is_neox_style)
         key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
         return query, key
-
+    
     @staticmethod
     def get_input_positions(
         input_tokens: List[int],

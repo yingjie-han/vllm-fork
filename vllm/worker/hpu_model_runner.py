@@ -409,10 +409,10 @@ class HpuModelAdapter:
         if hasattr(current_module, 'prepare_cos_sin'):
             current_module.prepare_cos_sin(
                 positions, recompute_cos_sin=self.recompute_cos_sin)
-        else:
-            raise AttributeError(
-                "The module at the end of the path does not have \
-                a 'prepare_cos_sin' method.")
+        # else:
+        #     raise AttributeError(
+        #         "The module at the end of the path does not have \
+        #         a 'prepare_cos_sin' method.")
 
     def forward(self, *args, **kwargs):
         kwargs = kwargs.copy()
@@ -874,6 +874,8 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
         return self.model
 
     def _use_graphs(self, batch_size, seq_len, is_prompt):
+        if is_prompt:
+            return False        
         if self.enforce_eager:
             return False
         if self.skip_warmup:

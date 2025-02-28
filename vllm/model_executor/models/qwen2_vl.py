@@ -345,11 +345,13 @@ class Qwen2VisionAttention(nn.Module):
             for i in range(1, len(cu_seqlens)):
                 start_idx = cu_seqlens[i - 1]
                 end_idx = cu_seqlens[i]
+
                 q_i = q[:, start_idx:end_idx]
                 k_i = k[:, start_idx:end_idx]
                 v_i = v[:, start_idx:end_idx]
                 q_i, k_i, v_i = (rearrange(x, "b s h d -> b h s d")
                                  for x in [q_i, k_i, v_i])
+
                 output_i = F.scaled_dot_product_attention(q_i,
                                                           k_i,
                                                           v_i,
@@ -1347,10 +1349,10 @@ class Qwen2VLForConditionalGeneration(nn.Module, SupportsMultiModal,
             if image_input is None and video_input is None:
                 inputs_embeds = None
             else:
-                if uses_mrope(self.config):
-                    assert positions.ndim == 2 and positions.size(0) == 3, (
-                        "multimodal section rotary embedding requires "
-                        f"(3, seq_len) positions, but got {positions.size()}")
+                # if uses_mrope(self.config):
+                #     assert positions.ndim == 2 and positions.size(0) == 3, (
+                #         "multimodal section rotary embedding requires "
+                #         f"(3, seq_len) positions, but got {positions.size()}")
                 inputs_embeds = self.get_input_embeddings_v0(
                     input_ids,
                     image_input=image_input,
