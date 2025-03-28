@@ -31,7 +31,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
+from packaging.version import Version
 from transformers import BatchFeature
+from transformers import __version__ as TRANSFORMERS_VERSION
 from transformers.models.qwen2_vl import (Qwen2VLImageProcessor,
                                           Qwen2VLProcessor)
 from transformers.models.qwen2_vl.configuration_qwen2_vl import (
@@ -61,7 +63,7 @@ from vllm.multimodal.inputs import (ImageItem, ModalityData,
 from vllm.multimodal.parse import (ImageSize, ModalityDataItems,
                                    MultiModalDataItems, MultiModalDataParser)
 from vllm.multimodal.processing import (BaseMultiModalProcessor,
-                                        BaseProcessingInfo, PromptReplacement)
+                                        BaseProcessingInfo, PromptReplacement,ProcessingCache,_I)
 from vllm.multimodal.profiling import BaseDummyInputsBuilder, ProcessorInputs
 from vllm.platforms import _Backend
 from vllm.sequence import IntermediateTensors
@@ -73,13 +75,30 @@ from .utils import (AutoWeightsLoader, WeightsMapper,
                     merge_multimodal_embeddings)
 from .vision import get_vit_attn_backend
 
+import habana_frameworks.torch as htorch
+import math
+
 logger = init_logger(__name__)
 
 # For profile run
 _MAX_FRAMES_PER_VIDEO = 16
 
-# === Vision Inputs === #
+try:
+    from habana_frameworks.torch.hpex.kernels import FusedSDPA
+except ImportError:
+    print("Not using HPU fused scaled dot-product attention kernel.")
+    FusedSDPA = None
 
+class ModuleFusedSDPA(torch.nn.Module):
+    def __init__(self, fusedSDPA):
+        super().__init__()
+        self._hpu_kernel_fsdpa = fusedSDPA
+
+    def forward(self, query, key, value, attn_mask, dropout_p, is_casual, scale, softmax_mode):
+        return self._hpu_kernel_fsdpa.apply(query, key, value, attn_mask, dropout_p, is_casual, scale, softmax_mode)
+    
+    
+# === Vision Inputs === #
 
 class Qwen2VLImagePixelInputs(TypedDict):
     type: Literal["pixel_values"]
@@ -92,7 +111,25 @@ class Qwen2VLImagePixelInputs(TypedDict):
     """Shape: `(num_images, 3)`
     This should be in `(grid_t, grid_h, grid_w)` format.
     """
-
+    
+    attention_mask: List
+    """Shape: 
+    """
+    
+    patch_len: List
+    """Shape: 
+    """
+    
+    pixel_values_bucket_len: List
+    """Shape: 
+    """    
+    rotary_pos_emb_cos: List
+    """Shape: 
+    """    
+    rotary_pos_emb_sin: List
+    """Shape: 
+    """    
+    img_idx: List    
 
 class Qwen2VLImageEmbeddingInputs(TypedDict):
     type: Literal["image_embeds"]
@@ -157,6 +194,7 @@ class Qwen2VLVideoEmbeddingInputs(TypedDict):
 
 Qwen2VLVideoInputs = Union[Qwen2VLVideoPixelInputs,
                            Qwen2VLVideoEmbeddingInputs]
+
 
 # === Vision Encoder === #
 
@@ -225,18 +263,24 @@ def apply_rotary_emb_torch(x: torch.Tensor,
     )
 
 
-def apply_rotary_pos_emb_vision(t: torch.Tensor,
-                                freqs: torch.Tensor,
-                                use_flash_attn=False) -> torch.Tensor:
-    t_ = t.float()
-    cos = freqs.cos()
-    sin = freqs.sin()
-    apply_rotary_emb = apply_rotary_emb_torch
-    if use_flash_attn:
-        from flash_attn.layers.rotary import apply_rotary_emb
-    output = apply_rotary_emb(t_, cos, sin).type_as(t)
-    return output
+# def apply_rotary_pos_emb_vision(t: torch.Tensor,
+#                                 freqs: torch.Tensor,
+#                                 use_flash_attn=False) -> torch.Tensor:
+#     t_ = t.float()
+#     cos = freqs.cos()
+#     sin = freqs.sin()
+#     apply_rotary_emb = apply_rotary_emb_torch
+#     if use_flash_attn:
+#         from flash_attn.layers.rotary import apply_rotary_emb
+#     output = apply_rotary_emb(t_, cos, sin).type_as(t)
+#     return output
 
+def apply_rotary_pos_emb_vision(t: torch.Tensor,
+                                cos: torch.Tensor,
+                                sin: torch.Tensor,) -> torch.Tensor:
+    t_ = t.float()
+    output = apply_rotary_emb_torch(t_, cos, sin).type_as(t)
+    return output
 
 class Qwen2VisionAttention(nn.Module):
 
@@ -301,8 +345,11 @@ class Qwen2VisionAttention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        rotary_pos_emb: torch.Tensor,
+        # cu_seqlens: torch.Tensor,
+        # rotary_pos_emb: torch.Tensor,
+        attention_mask: List,
+        rotary_pos_emb_cos: torch.Tensor = None,
+        rotary_pos_emb_sin: torch.Tensor = None,  
     ) -> torch.Tensor:
 
         # [s, b, c] --> [s, b, 3 * head * head_dim]
@@ -314,9 +361,12 @@ class Qwen2VisionAttention(nn.Module):
 
         q, k, v = (rearrange(x, "s b ... -> b s ...").contiguous()
                    for x in (q, k, v))
-        if rotary_pos_emb is not None:
-            q = apply_rotary_pos_emb_vision(q, rotary_pos_emb)
-            k = apply_rotary_pos_emb_vision(k, rotary_pos_emb)
+        # if rotary_pos_emb is not None:
+        #     q = apply_rotary_pos_emb_vision(q, rotary_pos_emb)
+        #     k = apply_rotary_pos_emb_vision(k, rotary_pos_emb)
+        if rotary_pos_emb_cos is not None:
+            q = apply_rotary_pos_emb_vision(q, rotary_pos_emb_cos,rotary_pos_emb_sin)
+            k = apply_rotary_pos_emb_vision(k, rotary_pos_emb_cos,rotary_pos_emb_sin)
 
         if self.attn_backend == _Backend.FLASH_ATTN:
             # from vllm_flash_attn.flash_attn_interface import (
@@ -342,22 +392,34 @@ class Qwen2VisionAttention(nn.Module):
         elif self.attn_backend == _Backend.TORCH_SDPA:
             # Execute attention entry by entry for speed & less VRAM.
             outputs = []
-            for i in range(1, len(cu_seqlens)):
-                start_idx = cu_seqlens[i - 1]
-                end_idx = cu_seqlens[i]
-
+            # for i in range(1, len(cu_seqlens)):
+            #     start_idx = cu_seqlens[i - 1]
+            #     end_idx = cu_seqlens[i]
+            start_idx = 0
+            for i in range(len(attention_mask)):
+                attention_mask_i = attention_mask[i]
+                seq_len = attention_mask[i].shape[-1]
+                end_idx = start_idx + seq_len
+                
                 q_i = q[:, start_idx:end_idx]
                 k_i = k[:, start_idx:end_idx]
                 v_i = v[:, start_idx:end_idx]
                 q_i, k_i, v_i = (rearrange(x, "b s h d -> b h s d")
                                  for x in [q_i, k_i, v_i])
-
-                output_i = F.scaled_dot_product_attention(q_i,
-                                                          k_i,
-                                                          v_i,
-                                                          dropout_p=0.0)
+                q_i=q_i.squeeze(0)
+                k_i=k_i.squeeze(0)
+                v_i=v_i.squeeze(0)
+                htorch.core.mark_step()
+                # output_i = F.scaled_dot_product_attention(q_i,
+                #                                           k_i,
+                #                                           v_i,
+                #                                           dropout_p=0.0)
+                output_i = ModuleFusedSDPA(FusedSDPA)(q_i, k_i, v_i, attention_mask_i, 0.0, False, None, softmax_mode="fast")             
+                htorch.core.mark_step()
+                output_i=output_i.unsqueeze(0)
                 output_i = rearrange(output_i, "b h s d -> b s h d ")
                 outputs.append(output_i)
+                start_idx = end_idx  
             context_layer = torch.cat(outputs, dim=1)
         elif self.attn_backend == _Backend.XFORMERS:
             from xformers import ops as xops
@@ -406,11 +468,19 @@ class Qwen2VisionBlock(nn.Module):
                                   quant_config=quant_config,
                                   prefix=f"{prefix}.mlp")
 
-    def forward(self, x: torch.Tensor, cu_seqlens: torch.Tensor,
-                rotary_pos_emb: torch.Tensor) -> torch.Tensor:
+    # def forward(self, x: torch.Tensor, cu_seqlens: torch.Tensor,
+    #             rotary_pos_emb: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, attention_mask: List,
+                rotary_pos_emb_cos: torch.Tensor = None,
+                rotary_pos_emb_sin: torch.Tensor = None,) -> torch.Tensor:
+                
+        # x = x + self.attn(self.norm1(x),
+        #                   cu_seqlens=cu_seqlens,
+        #                   rotary_pos_emb=rotary_pos_emb)
         x = x + self.attn(self.norm1(x),
-                          cu_seqlens=cu_seqlens,
-                          rotary_pos_emb=rotary_pos_emb)
+                          attention_mask=attention_mask,
+                          rotary_pos_emb_cos=rotary_pos_emb_cos,
+                          rotary_pos_emb_sin=rotary_pos_emb_sin)        
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -604,25 +674,30 @@ class Qwen2VisionTransformer(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        grid_thw: torch.Tensor,
+        #grid_thw: torch.Tensor,
+        attention_mask: List,
+        rotary_pos_emb_cos: torch.Tensor = None,
+        rotary_pos_emb_sin: torch.Tensor = None, 
     ) -> torch.Tensor:
         # patchify
         x = x.to(device=self.device, dtype=self.dtype)
         x = self.patch_embed(x)
 
-        # compute position embedding
-        rotary_pos_emb = self.rot_pos_emb(grid_thw)
+        # # compute position embedding
+        # rotary_pos_emb = self.rot_pos_emb(grid_thw)
 
-        # compute cu_seqlens
-        cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2],
-                                             grid_thw[:, 0]).cumsum(
-                                                 dim=0, dtype=torch.int32)
-        cu_seqlens = F.pad(cu_seqlens, (1, 0), "constant", 0)
+        # # compute cu_seqlens
+        # cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2],
+        #                                      grid_thw[:, 0]).cumsum(
+        #                                          dim=0, dtype=torch.int32)
+        # cu_seqlens = F.pad(cu_seqlens, (1, 0), "constant", 0)
 
+        htorch.core.mark_step()
         # transformers
         x = x.unsqueeze(1)
         for blk in self.blocks:
-            x = blk(x, cu_seqlens=cu_seqlens, rotary_pos_emb=rotary_pos_emb)
+            #x = blk(x, cu_seqlens=cu_seqlens, rotary_pos_emb=rotary_pos_emb)
+            x = blk(x, attention_mask=attention_mask, rotary_pos_emb_cos=rotary_pos_emb_cos,rotary_pos_emb_sin=rotary_pos_emb_sin)
 
         # adapter
         x = self.merger(x)
@@ -712,7 +787,6 @@ class Qwen2VLMultiModalDataParser(MultiModalDataParser):
     ) -> ModalityDataItems[Any, Any]:
         if isinstance(data, dict):
             return Qwen2VLEmbeddingItems(data, modality="image")
-
         return super()._parse_image_data(data)
 
     def _parse_video_data(
@@ -761,7 +835,13 @@ class Qwen2VLProcessingInfo(BaseProcessingInfo):
         hf_processor = self.get_hf_processor(min_pixels=min_pixels,
                                              max_pixels=max_pixels)
         image_processor = hf_processor.image_processor  # type: ignore
-        assert isinstance(image_processor, Qwen2VLImageProcessor)
+        if Version(TRANSFORMERS_VERSION) >= Version("4.49"):
+            from transformers.models.qwen2_vl import Qwen2VLImageProcessorFast
+            assert isinstance(
+                image_processor,
+                (Qwen2VLImageProcessor, Qwen2VLImageProcessorFast))
+        else:
+            assert isinstance(image_processor, Qwen2VLImageProcessor)
         return image_processor
 
     def get_supported_mm_limits(self) -> Mapping[str, Optional[int]]:
@@ -952,10 +1032,69 @@ class Qwen2VLDummyInputsBuilder(BaseDummyInputsBuilder[Qwen2VLProcessingInfo]):
             mm_data=mm_data,
         )
 
+def update_freqs(dim,seqlen) -> None:
+    theta = 10000.0
+    seqlen *= 2
+    inv_freq = 1.0 / (theta**(torch.arange(
+        0, dim, 2, dtype=torch.float)/ dim))
+    seq = torch.arange(seqlen,dtype=inv_freq.dtype)
+    freqs = torch.outer(seq, inv_freq)
+    return freqs
 
+def visual_rot_pos_emb(grid_thw: torch.Tensor,img_bucket: torch.Tensor,
+                       spatial_merge_size: torch.Tensor,rotary_pos_emb_full: torch.Tensor,) -> torch.Tensor:
+    pos_ids = []
+    #for t, h, w in grid_thw:
+    #for i in range(0,grid_thw.shape[0]):
+    if 1:        
+        t=grid_thw[0].item()
+        h=grid_thw[1].item()
+        w=grid_thw[2].item()
+        hpos_ids = torch.arange(h).unsqueeze(1).expand(-1, w)
+        wpos_ids = torch.arange(w).unsqueeze(0).expand(h, -1)
+        hpos_ids = hpos_ids.reshape(
+            h // spatial_merge_size,
+            spatial_merge_size,
+            w // spatial_merge_size,
+            spatial_merge_size,
+        ).permute(0, 2, 1, 3).flatten()
+        wpos_ids = wpos_ids.reshape(
+            h // spatial_merge_size,
+            spatial_merge_size,
+            w // spatial_merge_size,
+            spatial_merge_size,
+        ).permute(0, 2, 1, 3).flatten()
+        pos_ids.append(
+            torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1))
+    pos_ids = torch.cat(pos_ids, dim=0)
+    #max_grid_size = grid_thw[:, 1:].max()
+    #rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
+    #rotary_pos_emb_full = self.rotary_pos_emb()
+    rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
+    
+    return rotary_pos_emb
+
+
+#_I = TypeVar("_I", bound=BaseProcessingInfo)
 class Qwen2VLMultiModalProcessor(BaseMultiModalProcessor[Qwen2VLProcessingInfo]
                                  ):
-
+    def __init__(self,
+                 info: _I,
+                 dummy_inputs: "BaseDummyInputsBuilder[_I]",
+                 *,
+                 cache: Optional[ProcessingCache] = None,
+                 enable_sanity_checks: bool = True) -> None:
+        
+        super().__init__(info,dummy_inputs,cache=cache,enable_sanity_checks=enable_sanity_checks)
+        
+        vision_config = self.info.ctx.model_config.hf_config.vision_config
+        embed_dim = vision_config.embed_dim
+        num_heads = vision_config.num_heads
+        head_dim = embed_dim // num_heads
+        self.seq_len_max = 32768
+        self.bucket_size = 128
+        self.rotary_pos_emb_full = update_freqs(head_dim // 2,self.seq_len_max)
+        
     def _get_data_parser(self) -> MultiModalDataParser:
         return Qwen2VLMultiModalDataParser()
 
@@ -1019,7 +1158,94 @@ class Qwen2VLMultiModalProcessor(BaseMultiModalProcessor[Qwen2VLProcessingInfo]
                 "video", video_grid_sizes),
             video_grid_thw=MultiModalFieldConfig.batched("video"),
         )
+        
 
+    def _cached_apply_hf_processor(
+        self,
+        prompt: Union[str, list[int]],
+        mm_data_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
+    ) -> tuple[list[int], MultiModalKwargs]:
+        
+        prompt_ids, mm_kwargs = super()._cached_apply_hf_processor(prompt,mm_data_items,hf_processor_mm_kwargs)
+        
+        mm_kwargs = self._get_bucket_input(mm_kwargs)
+        return prompt_ids, mm_kwargs
+    
+    #单prompt多图的情况，多图取共同的bucket，多图attentionmask合并tensor后放入list               
+    def _get_bucket_input(
+        self,
+        inputs: MultiModalKwargs,
+        # embed_dim: int,
+        # merge_hidden_size: int,
+        # rotary_pos_emb_full: torch.Tensor,
+        # vision_spatial_merge_size: int,
+    ) -> MultiModalKwargs:
+        if "pixel_values" not in inputs:
+            return inputs
+        
+        pixel_values = inputs["pixel_values"]
+        grid_thw= inputs["image_grid_thw"]
+        
+        vision_config = self.info.ctx.model_config.hf_config.vision_config
+        embed_dim = vision_config.embed_dim
+        #num_heads = vision_config.num_heads
+        #head_dim = embed_dim // num_heads
+        vision_spatial_merge_size = vision_config.spatial_merge_size
+        merger_spatial_merge_size = 2
+        merge_hidden_size =embed_dim * (merger_spatial_merge_size**2)
+            
+        #bucket = 128
+        # seq_len_max = 16384
+        # rotary_pos_emb_full = update_freqs(head_dim // 2,seq_len_max)
+                
+        cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2],
+                                                grid_thw[:, 0]).cumsum(
+                                                    dim=0, dtype=torch.int32)
+        cu_seqlens = F.pad(cu_seqlens, (1, 0), "constant", 0)
+        
+        
+        img_bucket = 0
+        img_num = cu_seqlens.shape[0]-1
+        for i in range(img_num):
+            img_bucket = max(img_bucket,math.ceil((cu_seqlens[i+1]-cu_seqlens[i])/self.bucket_size)*self.bucket_size)
+            
+        img_patch_nums, patch_sizes = pixel_values.shape
+        
+        pixel_value_padded = torch.zeros(img_num,img_bucket,patch_sizes)
+        attention_mask = torch.zeros([img_num,img_bucket,img_bucket], dtype=torch.bool)
+        patch_len = torch.zeros([img_num],dtype=torch.int)
+        pixel_values_bucket_len = torch.zeros([img_num],dtype=torch.int)  
+        rotary_pos_emb_cos_padded = torch.zeros(img_num,img_bucket,self.rotary_pos_emb_full.shape[-1]*2)
+        rotary_pos_emb_sin_padded = torch.zeros(img_num,img_bucket,self.rotary_pos_emb_full.shape[-1]*2)
+            
+        for i in range(img_num):
+            img_start = cu_seqlens[i]
+            img_end = cu_seqlens[i+1]
+            img_len = img_end - img_start
+
+            pixel_value_padded[i,0:img_len,:] = pixel_values[img_start:img_end,:]
+            attention_mask[i,0:img_len,0:img_len] = True
+            patch_len[i]=int(img_len*embed_dim/merge_hidden_size)
+            pixel_values_bucket_len[i]=img_bucket
+        
+        
+            rotary_pos_emb = visual_rot_pos_emb(grid_thw[i],pixel_values_bucket_len[i],
+                                vision_spatial_merge_size,self.rotary_pos_emb_full)
+            cos_i = rotary_pos_emb.cos()
+            sin_i = rotary_pos_emb.sin() 
+            rotary_pos_emb_cos_padded[i,:cos_i.shape[0]] = cos_i
+            rotary_pos_emb_sin_padded[i,:sin_i.shape[0]] = sin_i
+               
+        inputs["pixel_values"] = pixel_value_padded     
+        inputs["attention_mask"] = attention_mask
+        inputs["patch_len"] = patch_len
+        inputs["pixel_values_bucket_len"]= pixel_values_bucket_len
+        inputs["rotary_pos_emb_cos_padded"]= rotary_pos_emb_cos_padded
+        inputs["rotary_pos_emb_sin_padded"]= rotary_pos_emb_sin_padded 
+        
+        return inputs
+        
 
 @MULTIMODAL_REGISTRY.register_processor(Qwen2VLMultiModalProcessor,
                                         info=Qwen2VLProcessingInfo,
@@ -1123,15 +1349,20 @@ class Qwen2VLForConditionalGeneration(nn.Module, SupportsMultiModal,
         pixel_values = kwargs.pop("pixel_values", None)
         image_embeds = kwargs.pop("image_embeds", None)
         image_grid_thw = kwargs.pop("image_grid_thw", None)
-
+        attention_mask = kwargs.pop("attention_mask", None)
+        patch_len = kwargs.pop("patch_len", None)
+        pixel_values_bucket_len =  kwargs.pop("pixel_values_bucket_len", None)
+        rotary_pos_emb_cos_padded = kwargs.pop("rotary_pos_emb_cos_padded", None)
+        rotary_pos_emb_sin_padded = kwargs.pop("rotary_pos_emb_sin_padded", None)
+        
         if pixel_values is None and image_embeds is None:
             return None
 
         if pixel_values is not None:
-            pixel_values = self._validate_and_reshape_mm_tensor(
-                pixel_values, "image pixel values")
-            image_grid_thw = self._validate_and_reshape_mm_tensor(
-                image_grid_thw, "image grid_thw")
+            # pixel_values = self._validate_and_reshape_mm_tensor(
+            #     pixel_values, "image pixel values")
+            # image_grid_thw = self._validate_and_reshape_mm_tensor(
+            #     image_grid_thw, "image grid_thw")
 
             if not isinstance(pixel_values, (torch.Tensor, list)):
                 raise ValueError("Incorrect type of image pixel values. "
@@ -1139,7 +1370,12 @@ class Qwen2VLForConditionalGeneration(nn.Module, SupportsMultiModal,
 
             return Qwen2VLImagePixelInputs(type="pixel_values",
                                            pixel_values=pixel_values,
-                                           image_grid_thw=image_grid_thw)
+                                           image_grid_thw=image_grid_thw,
+                                           attention_mask=attention_mask,
+                                           patch_len=patch_len,
+                                           pixel_values_bucket_len=pixel_values_bucket_len,
+                                           rotary_pos_emb_cos_padded=rotary_pos_emb_cos_padded,
+                                           rotary_pos_emb_sin_padded=rotary_pos_emb_sin_padded,)
 
         if image_embeds is not None:
             image_embeds = self._validate_and_reshape_mm_tensor(
@@ -1192,19 +1428,76 @@ class Qwen2VLForConditionalGeneration(nn.Module, SupportsMultiModal,
             self, image_input: Qwen2VLImageInputs) -> tuple[torch.Tensor, ...]:
 
         grid_thw = image_input["image_grid_thw"]
-        assert grid_thw.ndim == 2
-
+        #assert grid_thw.ndim == 2
+  
+        
         if image_input["type"] == "image_embeds":
             image_embeds = image_input["image_embeds"].type(self.visual.dtype)
         else:
-            pixel_values = image_input["pixel_values"].type(self.visual.dtype)
-            image_embeds = self.visual(pixel_values, grid_thw=grid_thw)
+            #pixel_values = image_input["pixel_values"].type(self.visual.dtype)
+            pixel_values = image_input["pixel_values"]  
+            attention_mask = image_input["attention_mask"]
+            patch_len = image_input["patch_len"]
+            pixel_values_bucket_len =  image_input["pixel_values_bucket_len"]
+            rotary_pos_emb_cos_padded = image_input["rotary_pos_emb_cos_padded"]
+            rotary_pos_emb_sin_padded = image_input["rotary_pos_emb_sin_padded"] 
+            
+            prompt_bs = len(attention_mask)
+            pixel_values_flattened_list = []
+            attention_mask_list = []
+            rotary_pos_emb_cos_list = []
+            rotary_pos_emb_sin_list = [] 
+            image_embeds_list = []
+            n_images_total = 0
+
+            for i in range(prompt_bs):
+                if isinstance(attention_mask[i], list):
+                    n_images_in_prompt = len(attention_mask[i])
+                else:
+                    n_images_in_prompt = attention_mask[i].shape[0]
+                n_images_total += n_images_in_prompt
+
+                for j in range(n_images_in_prompt):
+                    pixel_values_bucket_len_ij = pixel_values_bucket_len[i][j]
+
+                    pixel_values_ij = pixel_values[i][j]
+                    grid_thw_ij=image_input["image_grid_thw"][i][j].unsqueeze(0)
+
+                    attention_mask_ij= attention_mask[i][j]  
+                    if attention_mask_ij.ndim == 2:
+                        attention_mask_ij = attention_mask_ij.unsqueeze(0)          
+
+                    
+                    # # compute position embedding
+                    # rotary_pos_emb = self.visual.rot_pos_emb(grid_thw_ij)
+                    # rotary_pos_emb_cos = rotary_pos_emb.cos()
+                    # rotary_pos_emb_sin = rotary_pos_emb.sin() 
+                    rotary_pos_emb_cos = rotary_pos_emb_cos_padded[i][j]
+                    rotary_pos_emb_sin = rotary_pos_emb_sin_padded[i][j]
+
+                    
+                    pixel_values_flattened_list.append(pixel_values_ij)
+                    attention_mask_list.append(attention_mask_ij)
+                    rotary_pos_emb_cos_list.append(rotary_pos_emb_cos)
+                    rotary_pos_emb_sin_list.append(rotary_pos_emb_sin)  
+
+            
+            pixel_values_flattened = torch.cat(pixel_values_flattened_list, dim=0)
+            rotary_pos_emb_cos_flattened = torch.cat(rotary_pos_emb_cos_list, dim=0)            
+            rotary_pos_emb_sin_flattened = torch.cat(rotary_pos_emb_sin_list, dim=0)
+                     
+            image_embeds = self.visual(pixel_values_flattened,
+                                attention_mask_list,
+                                rotary_pos_emb_cos_flattened,
+                                rotary_pos_emb_sin_flattened)                             
+            #image_embeds = self.visual(pixel_values, grid_thw=grid_thw)
 
         # Split concatenated embeddings for each image item.
-        merge_size = self.visual.spatial_merge_size
-        sizes = grid_thw.prod(-1) // merge_size // merge_size
+        # merge_size = self.visual.spatial_merge_size
+        # sizes = grid_thw.prod(-1) // merge_size // merge_size     
 
-        return image_embeds.split(sizes.tolist())
+        #return image_embeds.split(sizes.tolist())
+        return image_embeds
 
     def _process_video_input(
             self, video_input: Qwen2VLVideoInputs) -> tuple[torch.Tensor, ...]:
@@ -1267,6 +1560,17 @@ class Qwen2VLForConditionalGeneration(nn.Module, SupportsMultiModal,
 
         return multimodal_embeddings
 
+    def _merge_multimodal_embeddings_v2(
+        self,
+        input_ids: torch.Tensor,
+        inputs_embeds: torch.Tensor,
+        multimodal_embeddings: torch.Tensor,
+        placeholder_token_id: int,
+    ) -> torch.Tensor:
+
+        inputs_embeds.index_put_([input_ids == placeholder_token_id], multimodal_embeddings)
+        return inputs_embeds
+    
     def get_input_embeddings(
         self,
         input_ids: torch.Tensor,
@@ -1285,11 +1589,19 @@ class Qwen2VLForConditionalGeneration(nn.Module, SupportsMultiModal,
         image_input: Optional[tuple[torch.Tensor, ...]] = None,
         video_input: Optional[tuple[torch.Tensor, ...]] = None,
     ) -> torch.Tensor:
-
+        #print("get_input_embeddings_v0-input_ids=",input_ids)
         inputs_embeds = self.get_input_embeddings(input_ids)
+        #print("get_input_embeddings_v0-inputs_embeds=",inputs_embeds)
         if image_input is not None:
             image_embeds = self._process_image_input(image_input)
-            inputs_embeds = merge_multimodal_embeddings(
+            # inputs_embeds = merge_multimodal_embeddings(
+            #     input_ids,
+            #     inputs_embeds,
+            #     image_embeds,
+            #     placeholder_token_id=self.config.image_token_id,
+            # )
+            htorch.core.mark_step()
+            inputs_embeds = self._merge_multimodal_embeddings_v2(                   
                 input_ids,
                 inputs_embeds,
                 image_embeds,
@@ -1298,10 +1610,16 @@ class Qwen2VLForConditionalGeneration(nn.Module, SupportsMultiModal,
 
         if video_input is not None:
             video_embeds = self._process_video_input(video_input)
-            inputs_embeds = merge_multimodal_embeddings(
+            # inputs_embeds = merge_multimodal_embeddings(
+            #     input_ids,
+            #     inputs_embeds,
+            #     video_embeds,
+            #     placeholder_token_id=self.config.video_token_id,
+            # )
+            inputs_embeds = self._merge_multimodal_embeddings_v2(                   
                 input_ids,
                 inputs_embeds,
-                video_embeds,
+                image_embeds,
                 placeholder_token_id=self.config.video_token_id,
             )
         return inputs_embeds
@@ -1336,6 +1654,7 @@ class Qwen2VLForConditionalGeneration(nn.Module, SupportsMultiModal,
                 `None` if no videos are passed.
         """
 
+        
         if intermediate_tensors is not None:
             inputs_embeds = None
 
@@ -1358,7 +1677,8 @@ class Qwen2VLForConditionalGeneration(nn.Module, SupportsMultiModal,
                     image_input=image_input,
                     video_input=video_input)
                 input_ids = None
-
+        
+        htorch.core.mark_step()
         hidden_states = self.language_model.model(
             input_ids=input_ids,
             positions=positions,
