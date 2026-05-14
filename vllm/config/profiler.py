@@ -13,7 +13,7 @@ from vllm.utils.hashing import safe_hash
 
 logger = init_logger(__name__)
 
-ProfilerKind = Literal["torch", "cuda"]
+ProfilerKind = Literal["torch", "cuda", "xpu"]
 
 
 def _is_uri_path(path: str) -> bool:
@@ -38,7 +38,8 @@ class ProfilerConfig:
     """Which profiler to use. Defaults to None. Options are:
 
     - 'torch': Use PyTorch profiler.
-    - 'cuda': Use CUDA profiler."""
+    - 'cuda': Use CUDA profiler.
+    - 'xpu': Use XPU profiler."""
 
     torch_profiler_dir: str = ""
     """Directory to save torch profiler traces. Both AsyncLLM's CPU traces and

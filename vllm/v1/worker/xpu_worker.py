@@ -2,14 +2,18 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import gc
 import os
+from typing import Any
 
+import ittapi
+import ittapi.compat as itt
 import torch
+from typing_extensions import override
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
-from vllm.profiler.wrapper import TorchProfilerWrapper
+from vllm.profiler.wrapper import ProfilerConfig, TorchProfilerWrapper, WorkerProfiler
 from vllm.utils.mem_utils import MemorySnapshot, format_gib
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.utils import report_usage_stats
@@ -20,6 +24,24 @@ from vllm.v1.worker.xpu_model_runner import XPUModelRunner, XPUModelRunnerV2
 from .utils import request_memory
 
 logger = init_logger(__name__)
+
+
+class XpuProfilerWrapper(WorkerProfiler):
+    def __init__(self, profiler_config: ProfilerConfig) -> None:
+        super().__init__(profiler_config)
+
+    @override
+    def _start(self) -> None:
+        itt.resume()
+
+    @override
+    def _stop(self) -> None:
+        torch.xpu.synchronize()
+        itt.pause()
+
+    @override
+    def annotate_context_manager(self, name: str):
+        return ittapi.task(name)
 
 
 class XPUWorker(Worker):
@@ -159,12 +181,23 @@ class XPUWorker(Worker):
                 f"{profile_prefix}_{rank_suffix}" if profile_prefix else rank_suffix
             )
 
-            self.profiler = TorchProfilerWrapper(
-                self.profiler_config,
-                worker_name=trace_name,
-                local_rank=self.local_rank,
-                activities=["CPU", "XPU"],
-            )
-            logger.debug("Starting torch profiler with trace name: %s", trace_name)
+            profiler_type = self.profiler_config.profiler
+            if profiler_type == "torch":
+                self.profiler: Any | None = TorchProfilerWrapper(
+                    self.profiler_config,
+                    worker_name=trace_name,
+                    local_rank=self.local_rank,
+                    activities=["CPU", "XPU"],
+                )
+
+                logger.debug("Starting torch profiler with trace name: %s", trace_name)
+            elif profiler_type == "xpu":
+                self.profiler = XpuProfilerWrapper(self.profiler_config)
+                logger.debug("Starting XPU profiler")
+            else:
+                # Config validation should prevent this code being reached
+                raise ValueError(
+                    f"Invalid profiler value of {self.profiler_config.profiler}"
+                )
 
         super().profile(is_start=is_start, profile_prefix=profile_prefix)

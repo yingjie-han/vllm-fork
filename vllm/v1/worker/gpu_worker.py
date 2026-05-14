@@ -155,7 +155,7 @@ class Worker(WorkerBase):
         self.profiler_config = vllm_config.profiler_config
 
         # Only validate profiler config is valid, don't instantiate yet
-        if self.profiler_config.profiler not in ("torch", "cuda", None):
+        if self.profiler_config.profiler not in ("torch", "cuda", "xpu", None):
             raise ValueError(f"Unknown profiler type: {self.profiler_config.profiler}")
 
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
