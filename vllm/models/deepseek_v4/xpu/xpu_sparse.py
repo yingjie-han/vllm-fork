@@ -1,10 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""XPU DeepSeek-V4 attention subclass.
+"""XPU DeepSeek-V4 attention subclasses.
 
-Subclasses the shared ``DeepseekV4Attention`` ABC and provides XPU-native
-Triton kernels for decode (FP8 dequant + BF16 attention) and prefill
-(BF16 gathered KV + sparse attention).
+Provides two concrete attention classes for XPU:
+
+* ``DeepseekV4XPUAttention`` – Triton-based baseline (always available).
+  Decode uses ``xpu_sparse_decode_fp8``; prefill uses
+  ``triton_bf16_mla_sparse_interface``.
+
+* ``DeepseekV4XPUFlashMLAAttention`` – optimised path using xattention
+  (``flash_attn`` package).  Active when ``flash_attn`` is importable.
+  Decode uses ``flash_mla_with_kvcache``; prefill uses
+  ``flash_mla_sparse_fwd``.  Both backends share the same block-segregated
+  fp8_ds_mla KV cache layout so no format conversion is needed.
+
+``get_deepseek_v4_xpu_attn_cls()`` returns the best available class.
 """
 
 from typing import TYPE_CHECKING, cast
@@ -30,6 +40,18 @@ from vllm.v1.worker.workspace import current_workspace_manager
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
+
+# ---------------------------------------------------------------------------
+# Optional xattention (flash_attn) backend
+# ---------------------------------------------------------------------------
+try:
+    from flash_attn.flash_attn_interface_xpu import (
+        flash_mla_sparse_fwd as _flash_mla_sparse_fwd,
+        flash_mla_with_kvcache as _flash_mla_with_kvcache,
+    )
+    _XATTN_AVAILABLE = True
+except ImportError:
+    _XATTN_AVAILABLE = False
 
 
 class DeepseekV4XPUSparseBackend(DeepseekV4FlashMLABackend):
@@ -214,6 +236,23 @@ class DeepseekV4XPUAttention(DeepseekV4Attention):
         swa_lens = swa_metadata.decode_swa_lens
 
         assert swa_indices is not None and swa_lens is not None
+        self._run_decode_attn(
+            q, kv_cache, swa_indices, swa_lens, topk_indices, topk_lens,
+            swa_only, output,
+        )
+
+    def _run_decode_attn(
+        self,
+        q: torch.Tensor,
+        kv_cache: torch.Tensor | None,
+        swa_indices: torch.Tensor,
+        swa_lens: torch.Tensor,
+        topk_indices: torch.Tensor | None,
+        topk_lens: torch.Tensor | None,
+        swa_only: bool,
+        output: torch.Tensor,
+    ) -> None:
+        """Dispatch the decode attention kernel (Triton FP8 path)."""
         xpu_sparse_decode_fp8(
             q=q,
             kv_cache=kv_cache,
@@ -338,13 +377,106 @@ class DeepseekV4XPUAttention(DeepseekV4Attention):
                 N,
             )
 
-            kv_ws = kv[:chunk_size].reshape(-1, 1, q.shape[-1])
-            out, _, _ = triton_bf16_mla_sparse_interface(
-                q=q[query_start:query_end],
-                kv=kv_ws,
-                indices=combined_indices.unsqueeze(1),
-                sm_scale=self.scale,
-                d_v=q.shape[-1],
-                block_dpe=0,
+            self._run_prefill_attn_chunk(
+                q_chunk=q[query_start:query_end],
+                kv_chunk=kv[:chunk_size],
+                combined_indices=combined_indices,
+                combined_lens=combined_lens,
+                output_chunk=output[query_start:query_end],
             )
-            output[query_start:query_end] = out
+
+    def _run_prefill_attn_chunk(
+        self,
+        q_chunk: torch.Tensor,
+        kv_chunk: torch.Tensor,
+        combined_indices: torch.Tensor,
+        combined_lens: torch.Tensor,
+        output_chunk: torch.Tensor,
+    ) -> None:
+        """Dispatch one prefill chunk's attention kernel (Triton BF16 path)."""
+        kv_ws = kv_chunk.reshape(-1, 1, q_chunk.shape[-1])
+        out, _, _ = triton_bf16_mla_sparse_interface(
+            q=q_chunk,
+            kv=kv_ws,
+            indices=combined_indices.unsqueeze(1),
+            sm_scale=self.scale,
+            d_v=q_chunk.shape[-1],
+            block_dpe=0,
+        )
+        output_chunk[:] = out
+
+
+class DeepseekV4XPUFlashMLAAttention(DeepseekV4XPUAttention):
+    """XPU sparse MLA attention using xattention (flash_attn) kernels.
+
+    Overrides only the two kernel-dispatch hooks; all shared setup logic
+    (topk index computation, KV gather, chunk loop, etc.) lives in the base
+    class ``DeepseekV4XPUAttention``.
+
+    Active when the ``flash_attn`` package (xattention) is importable.
+    """
+
+    def _run_decode_attn(
+        self,
+        q: torch.Tensor,
+        kv_cache: torch.Tensor | None,
+        swa_indices: torch.Tensor,
+        swa_lens: torch.Tensor,
+        topk_indices: torch.Tensor | None,
+        topk_lens: torch.Tensor | None,
+        swa_only: bool,
+        output: torch.Tensor,
+    ) -> None:
+        """xattention FP8 sparse decode kernel."""
+        # q: (num_decode_tokens, h_q, d_qk) → (b, s_q=1, h_q, d_qk)
+        # kv caches: (nb, bs, 584) → (nb, bs, 1, 584)
+        _flash_mla_with_kvcache(
+            q=q.unsqueeze(1),
+            k_cache=self.swa_cache_layer.kv_cache.unsqueeze(-2),
+            block_table=None,
+            cache_seqlens=None,
+            head_dim_v=512,
+            tile_scheduler_metadata=None,
+            num_splits=None,
+            softmax_scale=self.scale,
+            causal=False,
+            is_fp8_kvcache=True,
+            indices=swa_indices,
+            attn_sink=self.attn_sink,
+            extra_k_cache=kv_cache.unsqueeze(-2) if kv_cache is not None else None,
+            extra_indices_in_kvcache=topk_indices,
+            topk_length=swa_lens,
+            extra_topk_length=topk_lens,
+            out=output.unsqueeze(1),
+        )
+
+    def _run_prefill_attn_chunk(
+        self,
+        q_chunk: torch.Tensor,
+        kv_chunk: torch.Tensor,
+        combined_indices: torch.Tensor,
+        combined_lens: torch.Tensor,
+        output_chunk: torch.Tensor,
+    ) -> None:
+        """xattention BF16 sparse prefill kernel."""
+        _flash_mla_sparse_fwd(
+            q=q_chunk,
+            kv=kv_chunk.view(-1, 1, q_chunk.shape[-1]),
+            indices=combined_indices.unsqueeze(1),
+            sm_scale=self.scale,
+            attn_sink=self.attn_sink,
+            topk_length=combined_lens,
+            out=output_chunk,
+        )
+
+
+def get_deepseek_v4_xpu_attn_cls() -> type[DeepseekV4XPUAttention]:
+    """Return the best available XPU attention class.
+
+    Uses ``DeepseekV4XPUFlashMLAAttention`` (xattention kernels) when the
+    ``flash_attn`` package is importable, otherwise falls back to the
+    Triton-based ``DeepseekV4XPUAttention``.
+    """
+    if _XATTN_AVAILABLE:
+        return DeepseekV4XPUFlashMLAAttention
+    return DeepseekV4XPUAttention

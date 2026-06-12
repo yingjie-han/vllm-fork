@@ -55,7 +55,7 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 from vllm.model_executor.utils import set_weight_attrs
-from vllm.models.deepseek_v4.xpu.xpu_sparse import DeepseekV4XPUAttention
+from vllm.models.deepseek_v4.xpu.xpu_sparse import get_deepseek_v4_xpu_attn_cls
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.triton_utils import tl, triton
@@ -828,7 +828,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
 
         self.rms_norm_eps = config.rms_norm_eps
-        self.attn = DeepseekV4XPUAttention(
+        self.attn = get_deepseek_v4_xpu_attn_cls()(
             vllm_config,
             prefix=f"{prefix}.attn",
             topk_indices_buffer=topk_indices_buffer,
