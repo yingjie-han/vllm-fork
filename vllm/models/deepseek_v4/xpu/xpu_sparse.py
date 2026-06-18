@@ -90,11 +90,7 @@ class DeepseekV4XPUAttention(DeepseekV4Attention):
         )
         assert swa_metadata is not None
 
-        from vllm.models.deepseek_v4.xpu.xpu_qnorm_rope_kv_fp8_insert import (
-            xpu_qnorm_rope_kv_fp8_insert,
-        )
-
-        xpu_qnorm_rope_kv_fp8_insert(
+        torch.ops._xpu_C.deepseek_qnorm_rope_kv_insert(
             q,
             kv,
             self.swa_cache_layer.kv_cache,
@@ -103,6 +99,7 @@ class DeepseekV4XPUAttention(DeepseekV4Attention):
             self.rotary_emb.cos_sin_cache,
             self.eps,
             swa_metadata.block_size,
+            "fp8_ds_mla",
         )
         return q
 
