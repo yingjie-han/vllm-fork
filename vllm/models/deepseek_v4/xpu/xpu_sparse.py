@@ -442,7 +442,15 @@ class DeepseekV4XPUFlashMLAAttention(DeepseekV4XPUAttention):
             causal=False,
             is_fp8_kvcache=True,
             indices=swa_indices,
-            attn_sink=self.attn_sink,
+            # TEMPORARY: disable the attention sink to match the Triton path
+            # (``xpu_sparse_decode_fp8`` ignores ``attn_sink``). Applying the
+            # learned sink here currently *lowers* GSM8K accuracy on XPU
+            # (78 vs 84 without it), because a latent systematic scaling error
+            # in the XPU fp8 attention scores is hidden by softmax
+            # normalization but amplified by the sink. Revert this commit once
+            # the underlying fp8/score-scale issue is fixed so the sink helps
+            # (as it does on CUDA: ~95).
+            attn_sink=None,
             extra_k_cache=kv_cache.unsqueeze(-2) if kv_cache is not None else None,
             extra_indices_in_kvcache=topk_indices,
             topk_length=swa_lens,
@@ -464,7 +472,11 @@ class DeepseekV4XPUFlashMLAAttention(DeepseekV4XPUAttention):
             kv=kv_chunk.view(-1, 1, q_chunk.shape[-1]),
             indices=combined_indices.unsqueeze(1),
             sm_scale=self.scale,
-            attn_sink=self.attn_sink,
+            # TEMPORARY: disable the attention sink to match the Triton path
+            # (``triton_bf16_mla_sparse_interface`` has no sink support).
+            # See the note in ``_run_decode_attn`` above. Revert this commit
+            # once the XPU fp8/score-scale issue is fixed.
+            attn_sink=None,
             topk_length=combined_lens,
             out=output_chunk,
         )
