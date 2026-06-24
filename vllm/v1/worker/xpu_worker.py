@@ -5,6 +5,7 @@ import os
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -78,6 +79,11 @@ class XPUWorker(Worker):
             torch.accelerator.set_device_index(self.device)
             current_platform.check_if_supports_dtype(self.model_config.dtype)
             torch.accelerator.empty_cache()
+            if envs.VLLM_XPU_DETERMINISTIC:
+                # Some XPU oneDNN/oneMKL matmul kernels use non-deterministic
+                # reductions; enable deterministic algorithms for reproducible
+                # (e.g. greedy) decoding at the cost of some performance.
+                torch.use_deterministic_algorithms(True, warn_only=True)
             self.init_gpu_memory = torch.xpu.get_device_properties(
                 self.local_rank
             ).total_memory
