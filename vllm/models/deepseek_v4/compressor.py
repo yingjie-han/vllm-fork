@@ -14,6 +14,7 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 from vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache import (
     compress_norm_rope_store_triton,
+    compress_norm_rope_store_xpu_mxfp4,
 )
 from vllm.models.deepseek_v4.common.ops.fused_indexer_q import MXFP4_BLOCK_SIZE
 from vllm.models.deepseek_v4.common.ops.save_partial_states import (
@@ -397,6 +398,9 @@ class DeepseekCompressor(nn.Module):
             ):
                 return
             compress_norm_rope_store_fn = compress_norm_rope_store_triton
+        elif current_platform.is_xpu() and self.use_fp4_cache:
+            # XPU SYCL kernel for MXFP4 indexer path (head_dim=128).
+            compress_norm_rope_store_fn = compress_norm_rope_store_xpu_mxfp4
             extra_kwargs = {}
         else:
             # Indexer path (head_dim == 128) or non-CUDA GPUs (AMD, XPU, etc.).
