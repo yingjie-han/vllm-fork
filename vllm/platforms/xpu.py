@@ -243,6 +243,18 @@ class XPUPlatform(Platform):
         if "VLLM_WORKER_MULTIPROC_METHOD" not in os.environ:
             os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
+        # When using the XPU profiler (unitrace-based), ensure a non-zero
+        # shutdown timeout so the EngineCore subprocess can exit cleanly and
+        # unitrace has time to flush device traces before the process is killed.
+        if (vllm_config.profiler_config is not None
+                and vllm_config.profiler_config.profiler == "xpu"
+                and vllm_config.shutdown_timeout == 0):
+            vllm_config.shutdown_timeout = 30
+            logger.info(
+                "Setting shutdown_timeout to 30s for XPU profiler "
+                "(unitrace requires a clean process exit to flush traces)."
+            )
+
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: "VllmConfig") -> None:
         super().update_block_size_for_backend(vllm_config)
