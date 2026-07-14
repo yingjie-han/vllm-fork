@@ -26,11 +26,13 @@ from vllm.models.deepseek_v4.attention import DeepseekV4Attention
 from vllm.models.deepseek_v4.common.ops import (
     combine_topk_swa_indices,
     compute_global_topk_indices_and_lens,
-    dequantize_and_gather_k_cache,
 )
 from vllm.models.deepseek_v4.sparse_mla import (
     DeepseekV4FlashMLABackend,
     DeepseekV4FlashMLAMetadata,
+)
+from vllm.models.deepseek_v4.xpu.xpu_dequant_gather import (
+    dequantize_and_gather_k_cache,
 )
 from vllm.models.deepseek_v4.xpu.xpu_sparse_decode_fp8 import (
     xpu_sparse_decode_fp8,
@@ -47,6 +49,8 @@ if TYPE_CHECKING:
 try:
     from flash_attn.flash_attn_interface_xpu import (
         flash_mla_sparse_fwd as _flash_mla_sparse_fwd,
+    )
+    from flash_attn.flash_attn_interface_xpu import (
         flash_mla_with_kvcache as _flash_mla_with_kvcache,
     )
     _XATTN_AVAILABLE = True
