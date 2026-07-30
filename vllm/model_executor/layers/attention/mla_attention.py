@@ -672,20 +672,24 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         if fp8_attention and self.kv_cache_dtype != "fp8_ds_mla":
             kv_cache = kv_cache.view(current_platform.fp8_dtype())
 
-        # Sparse MLA impls only support forward_mqa (decode-style attention)
-        is_sparse_impl = isinstance(self.impl, SparseMLAAttentionImpl)
+        assert (
+            attn_metadata.num_decodes is not None
+            and attn_metadata.num_prefills is not None
+            and attn_metadata.num_decode_tokens is not None
+        )
+        num_mqa_tokens = attn_metadata.num_decode_tokens
+        num_mha_tokens = q.size(0) - num_mqa_tokens
 
-        if is_sparse_impl:
-            num_mqa_tokens = q.size(0)
-            num_mha_tokens = 0
-        else:
-            assert (
-                attn_metadata.num_decodes is not None
-                and attn_metadata.num_prefills is not None
-                and attn_metadata.num_decode_tokens is not None
+        if self.impl.is_sparse and num_mha_tokens > 0:
+            prefill_max_seq_len = attn_metadata.prefill_max_seq_len  # type: ignore[attr-defined]
+            use_mha = (
+                self.prefill_backend is not None
+                and prefill_max_seq_len <= attn_metadata.topk_tokens  # type: ignore[attr-defined]
+                and not self._vllm_config.attention_config.sparse_mla_force_mqa
             )
-            num_mqa_tokens = attn_metadata.num_decode_tokens
-            num_mha_tokens = q.size(0) - num_mqa_tokens
+            if not use_mha:
+                num_mqa_tokens = q.size(0)
+                num_mha_tokens = 0
 
         if num_mha_tokens > 0:
             self.impl.forward_mha(  # type: ignore[attr-defined]
@@ -769,7 +773,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 mqa_q = get_dcp_group().all_gather(mqa_q, dim=1)
 
             # call decode attn
-            if not is_sparse_impl:
+            if not self.impl.is_sparse:
                 assert attn_metadata.decode is not None
             attn_out, lse = self.impl.forward_mqa(mqa_q, kv_cache, attn_metadata, self)  # type: ignore[attr-defined]
 

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, Optional
 
@@ -21,17 +22,39 @@ from vllm.v1.attention.backend import (
     AttentionMetadata,
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
-    SparseMLAAttentionImpl,
+    MLAAttentionImpl,
 )
 from vllm.v1.attention.backends.mla.flashmla_sparse import (
     triton_convert_req_index_to_global_index,
 )
+from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.attention.ops.xpu_mla_sparse import triton_bf16_mla_sparse_interface
 from vllm.v1.kv_cache_interface import AttentionSpec
+
+try:
+    from flash_attn.flash_attn_interface_xpu import (
+        flash_mla_sparse_fwd as _flash_mla_sparse_fwd,
+    )
+
+    _XATTENTION_AVAILABLE = True
+except ImportError:
+    _XATTENTION_AVAILABLE = False
 
 if TYPE_CHECKING:
     from vllm.model_executor.models.deepseek_v2 import Indexer
 logger = init_logger(__name__)
+
+_SPARSE_MLA_TOPK_BLOCK_SIZE = 16
+_EFFECTIVE_TOPK_MODE = os.getenv("VLLM_XPU_MLA_EFFECTIVE_TOPK", "auto")
+if _EFFECTIVE_TOPK_MODE not in {"0", "1", "auto"}:
+    raise ValueError(
+        "VLLM_XPU_MLA_EFFECTIVE_TOPK must be one of: 0, 1, auto"
+    )
+
+
+def _get_effective_topk_width(max_seq_len: int, topk_tokens: int) -> int:
+    bucket = max(_SPARSE_MLA_TOPK_BLOCK_SIZE, 1 << (max_seq_len - 1).bit_length())
+    return min(bucket, topk_tokens)
 
 
 class XPUMLASparseBackend(AttentionBackend):
@@ -96,6 +119,11 @@ class XPUMLASparseMetadata(AttentionMetadata):
 
     block_size: int = 1
     topk_tokens: int = 2048
+    num_decodes: int = 0
+    num_prefills: int = 0
+    num_decode_tokens: int = 0
+    prefill_max_seq_len: int = 0
+    prefill: None = None
 
 
 @dataclass
@@ -142,6 +170,9 @@ class XPUMLASparseMetadataBuilder(AttentionMetadataBuilder[XPUMLASparseMetadata]
         fast_build: bool = False,
     ) -> XPUMLASparseMetadata:
         num_tokens = common_attn_metadata.num_actual_tokens
+        num_decodes, num_prefills, num_decode_tokens, _ = (
+            split_decodes_and_prefills(common_attn_metadata)
+        )
         starts = np.asarray(common_attn_metadata.query_start_loc_cpu, dtype=np.int32)
         seg_lengths = np.diff(starts)
         req_id_per_token = np.repeat(
@@ -166,11 +197,17 @@ class XPUMLASparseMetadataBuilder(AttentionMetadataBuilder[XPUMLASparseMetadata]
             req_id_per_token=req_id_per_token,
             block_size=self.kv_cache_spec.block_size,
             topk_tokens=self.topk_tokens,
+            num_decodes=num_decodes,
+            num_prefills=num_prefills,
+            num_decode_tokens=num_decode_tokens,
+            prefill_max_seq_len=common_attn_metadata.max_seq_len,
         )
         return metadata
 
 
-class XPUMLASparseImpl(SparseMLAAttentionImpl[XPUMLASparseMetadata]):
+class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata]):
+    is_sparse = True
+
     def __init__(
         self,
         num_heads: int,
@@ -184,7 +221,7 @@ class XPUMLASparseImpl(SparseMLAAttentionImpl[XPUMLASparseMetadata]):
         attn_type: str,
         kv_sharing_target_layer_name: str | None,
         # MLA Specific Arguments
-        topk_indice_buffer: torch.Tensor | None = None,
+        topk_indices_buffer: torch.Tensor | None = None,
         indexer: Optional["Indexer"] = None,
         **mla_args,
     ) -> None:
@@ -195,14 +232,19 @@ class XPUMLASparseImpl(SparseMLAAttentionImpl[XPUMLASparseMetadata]):
         self.kv_cache_dtype = kv_cache_dtype
         self.kv_lora_rank: int = mla_args["kv_lora_rank"]
         self.softmax_scale = scale
-        assert indexer is not None
-        self.topk_indices_buffer: torch.Tensor | None = indexer.topk_indices_buffer
+        # The indexer carries the shared buffer for normal layers and tests;
+        # the explicitly-passed buffer covers backbone skip layers, whose
+        # indexer is not constructed (see deepseek_v2.py).
+        self.topk_indices_buffer: torch.Tensor | None = (
+            indexer.topk_indices_buffer if indexer is not None else topk_indices_buffer
+        )
 
     def _forward_bf16_kv(
         self,
         q: torch.Tensor,  # [sq, heads, d_qk]
         kv_c_and_k_pe_cache: torch.Tensor,  # [blocks, heads, d_qk]
         topk_indices: torch.Tensor,  # [sq, topk]
+        topk_length: torch.Tensor,
         attn_metadata: XPUMLASparseMetadata,
     ) -> torch.Tensor:
         num_tokens = q.shape[0]
@@ -212,6 +254,16 @@ class XPUMLASparseImpl(SparseMLAAttentionImpl[XPUMLASparseMetadata]):
 
         topk_indices = topk_indices.view(num_tokens, 1, -1)
 
+        if _XATTENTION_AVAILABLE:
+            output = _flash_mla_sparse_fwd(
+                q,
+                kv_c_and_k_pe_cache,
+                topk_indices,
+                sm_scale=self.softmax_scale,
+                topk_length=topk_length,
+            )[0]
+            return output[:, : self.num_heads, :]
+
         output, _, _ = triton_bf16_mla_sparse_interface(
             q,
             kv_c_and_k_pe_cache,
@@ -220,6 +272,18 @@ class XPUMLASparseImpl(SparseMLAAttentionImpl[XPUMLASparseMetadata]):
         )
 
         return output[:, : self.num_heads, :]
+
+    def forward_mha(
+        self,
+        q: torch.Tensor,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        kv_c_and_k_pe_cache: torch.Tensor,
+        attn_metadata: XPUMLASparseMetadata,
+        k_scale: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        raise NotImplementedError("XPU MLA Sparse requires the MQA prefill path")
 
     def forward_mqa(
         self,
@@ -241,18 +305,34 @@ class XPUMLASparseImpl(SparseMLAAttentionImpl[XPUMLASparseMetadata]):
         num_actual_toks = q.shape[0]
 
         assert self.topk_indices_buffer is not None
-        topk_indices = self.topk_indices_buffer[:num_actual_toks]
+        effective_topk = attn_metadata.topk_tokens
+        if _EFFECTIVE_TOPK_MODE == "1" or (
+            _EFFECTIVE_TOPK_MODE == "auto" and not _XATTENTION_AVAILABLE
+        ):
+            effective_topk = _get_effective_topk_width(
+                attn_metadata.max_seq_len, attn_metadata.topk_tokens
+            )
+        topk_indices = self.topk_indices_buffer[
+            :num_actual_toks, :effective_topk
+        ]
 
-        topk_indices_global = triton_convert_req_index_to_global_index(
-            attn_metadata.req_id_per_token,
-            attn_metadata.block_table,
-            topk_indices,
-            BLOCK_SIZE=attn_metadata.block_size,
-            NUM_TOPK_TOKENS=attn_metadata.topk_tokens,
+        topk_indices_global, topk_length = (
+            triton_convert_req_index_to_global_index(
+                attn_metadata.req_id_per_token,
+                attn_metadata.block_table,
+                topk_indices,
+                BLOCK_SIZE=attn_metadata.block_size,
+                NUM_TOPK_TOKENS=effective_topk,
+                return_valid_counts=True,
+            )
         )
 
         attn_out = self._forward_bf16_kv(
-            q, kv_c_and_k_pe_cache, topk_indices_global, attn_metadata
+            q,
+            kv_c_and_k_pe_cache,
+            topk_indices_global,
+            topk_length,
+            attn_metadata,
         )
 
         return attn_out, None
