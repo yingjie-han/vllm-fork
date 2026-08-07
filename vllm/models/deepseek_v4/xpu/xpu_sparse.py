@@ -44,13 +44,13 @@ if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
 
 # ---------------------------------------------------------------------------
-# Optional xattention (flash_attn) backend
+# Optional xattention backend
 # ---------------------------------------------------------------------------
 try:
-    from flash_attn.flash_attn_interface_xpu import (
+    from xattention import (
         flash_mla_sparse_fwd as _flash_mla_sparse_fwd,
     )
-    from flash_attn.flash_attn_interface_xpu import (
+    from xattention import (
         flash_mla_with_kvcache as _flash_mla_with_kvcache,
     )
     _XATTN_AVAILABLE = True
@@ -513,7 +513,7 @@ def get_deepseek_v4_xpu_attn_cls() -> type[DeepseekV4XPUAttention]:
     """Return the best available XPU attention class.
 
     Uses ``DeepseekV4XPUFlashMLAAttention`` (xattention kernels) when the
-    ``flash_attn`` package is importable, otherwise falls back to the
+    ``xattention`` package is importable, otherwise falls back to the
     Triton-based ``DeepseekV4XPUAttention``.
     """
     if _XATTN_AVAILABLE:
