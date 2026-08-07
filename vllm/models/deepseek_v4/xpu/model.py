@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -15,6 +16,7 @@ from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
 )
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
@@ -53,6 +55,7 @@ from vllm.model_executor.models.utils import (
     is_pp_missing_parameter,
     make_layers,
     maybe_prefix,
+    sequence_parallel_chunk,
 )
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.models.deepseek_v4.xpu.xpu_sparse import get_deepseek_v4_xpu_attn_cls
@@ -595,11 +598,46 @@ direct_register_custom_op(
 )
 
 
+def _sequence_parallel_chunk_1d(x: torch.Tensor, tp_size: int) -> torch.Tensor:
+    """Chunk a 1D per-token tensor (e.g. input_ids) the same way
+    `sequence_parallel_chunk` chunks the 2D hidden states."""
+    remainder = x.size(0) % tp_size
+    if remainder != 0:
+        x = nn.functional.pad(x, (0, tp_size - remainder))
+    chunk = x.size(0) // tp_size
+    return x.narrow(0, get_tensor_model_parallel_rank() * chunk, chunk)
+
+
+def _sequence_parallel_chunk_nd(x: torch.Tensor) -> torch.Tensor:
+    """Chunk a per-token tensor with arbitrary trailing dims along dim 0."""
+    tail = x.shape[1:]
+    return sequence_parallel_chunk(x.reshape(x.size(0), -1)).view(-1, *tail)
+
+
+def _sequence_parallel_gather_nd(x: torch.Tensor, num_tokens: int) -> torch.Tensor:
+    """Inverse of `_sequence_parallel_chunk_nd` (drops the chunk padding)."""
+    tail = x.shape[1:]
+    gathered = tensor_model_parallel_all_gather(x.reshape(x.size(0), -1), 0)
+    return gathered[:num_tokens].view(-1, *tail)
+
+
+# Opt-in: run everything in the decoder layer except attention on the local
+# token chunk, so mhc_fused_post_pre / ffn_norm stop being replicated across
+# TP ranks. The MHC state (residual/post_mix/res_mix) then stays chunked across
+# layers and only the attention input is all-gathered.
+_SP_LAYER_BOUNDARY = os.environ.get("VLLM_DSV4_SP_LAYER", "0") == "1"
+
+# Total tokens in the batch below which the wider SP domain is not worth it:
+# the extra chunk/gather launches cost more than the elementwise work they save.
+_SP_LAYER_MIN_TOKENS = int(os.environ.get("VLLM_DSV4_SP_LAYER_MIN_TOKENS", "128"))
+
+
 class DeepseekV4MoE(nn.Module):
     def __init__(
         self,
         vllm_config: VllmConfig,
         prefix: str = "",
+        sp_chunk_external: bool = False,
     ):
         super().__init__()
 
@@ -610,6 +648,9 @@ class DeepseekV4MoE(nn.Module):
         self.use_mega_moe = (
             vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
         )
+        # When set, the caller hands us the local token chunk and expects a
+        # chunked result back. MegaMoE has its own EP scheme, so it opts out.
+        self.sp_chunk_external = sp_chunk_external and not self.use_mega_moe
         if self.use_mega_moe and not vllm_config.parallel_config.enable_expert_parallel:
             raise NotImplementedError(
                 "DeepSeek V4 MegaMoE currently requires expert parallel. "
@@ -745,13 +786,16 @@ class DeepseekV4MoE(nn.Module):
         )
 
     def forward(
-        self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+        sp_external: bool | None = None,
     ) -> torch.Tensor:
         if self.gate.tid2eid is not None and input_ids is None:
             raise ValueError("DeepSeek V4 hash MoE routing requires input_ids.")
 
         if not self.use_mega_moe:
-            return self._forward_fused_moe(hidden_states, input_ids)
+            return self._forward_fused_moe(hidden_states, input_ids, sp_external)
 
         org_shape = hidden_states.shape
         router_logits, _ = self.gate(hidden_states)
@@ -786,9 +830,24 @@ class DeepseekV4MoE(nn.Module):
         return final_hidden_states.view(org_shape)
 
     def _forward_fused_moe(
-        self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+        sp_external: bool | None = None,
     ) -> torch.Tensor:
         org_shape = hidden_states.shape
+        if sp_external is None:
+            sp_external = self.sp_chunk_external
+
+        if sp_external:
+            # Routed experts are TP-sharded over experts, so they need every
+            # token: expand the local chunk back to the (padded) full batch and
+            # slice our chunk out of the reduced result.
+            chunk_len = hidden_states.size(0)
+            hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
+            if input_ids is not None:
+                input_ids = tensor_model_parallel_all_gather(input_ids, 0)
+
         if self.experts.is_internal_router:
             final_hidden_states = self.experts(
                 hidden_states=hidden_states,
@@ -801,6 +860,11 @@ class DeepseekV4MoE(nn.Module):
                 hidden_states=hidden_states,
                 router_logits=router_logits,
                 input_ids=input_ids,
+            )
+
+        if sp_external:
+            final_hidden_states = final_hidden_states.narrow(
+                0, get_tensor_model_parallel_rank() * chunk_len, chunk_len
             )
 
         return final_hidden_states.view(org_shape)
@@ -834,7 +898,13 @@ class DeepseekV4DecoderLayer(nn.Module):
             topk_indices_buffer=topk_indices_buffer,
             aux_stream_list=aux_stream_list,
         )
-        self.ffn = DeepseekV4MoE(vllm_config, prefix=f"{prefix}.ffn")
+        self.ffn = DeepseekV4MoE(
+            vllm_config,
+            prefix=f"{prefix}.ffn",
+            sp_chunk_external=_SP_LAYER_BOUNDARY,
+        )
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.sp_layer = self.ffn.sp_chunk_external and self.tp_size > 1
 
         self.attn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
         self.ffn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
@@ -910,6 +980,9 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
         return layer_input, post_mix, res_mix
 
+    def sp_active(self, num_tokens: int) -> bool:
+        return self.sp_layer and num_tokens >= _SP_LAYER_MIN_TOKENS
+
     def hc_post(
         self,
         x: torch.Tensor,
@@ -930,12 +1003,16 @@ class DeepseekV4DecoderLayer(nn.Module):
     ) -> tuple[
         torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None
     ]:
+        sp_layer = self.sp_active(positions.size(0))
         if residual is None:
             # First layer: run standalone hc_pre
             residual = x
             x, post_mix, res_mix = self.hc_pre(
                 x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
             )
+            x = self.attn_norm(x)
+            # MHC state enters the SP domain only after attention below.
+            chunk_mhc_state = sp_layer
         else:
             residual, post_mix, res_mix, x = self.mhc_fused_post_pre(
                 x,
@@ -951,9 +1028,22 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_post_alpha,
                 self.hc_sinkhorn_iters,
             )
+            x = self.attn_norm(x)
+            chunk_mhc_state = False
+            if sp_layer:
+                # MHC state stays chunked; only attention needs all tokens.
+                x = tensor_model_parallel_all_gather(x, 0)[: positions.size(0)]
 
-        x = self.attn_norm(x)
         x = self.attn(positions, x, None)
+
+        if sp_layer:
+            x = sequence_parallel_chunk(x)
+            if chunk_mhc_state:
+                residual = _sequence_parallel_chunk_nd(residual)
+                post_mix = _sequence_parallel_chunk_nd(post_mix)
+                res_mix = _sequence_parallel_chunk_nd(res_mix)
+            if input_ids is not None:
+                input_ids = _sequence_parallel_chunk_1d(input_ids, self.tp_size)
 
         residual, post_mix, res_mix, x = self.mhc_fused_post_pre(
             x,
@@ -970,7 +1060,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_sinkhorn_iters,
         )
         x = self.ffn_norm(x)
-        x = self.ffn(x, input_ids)
+        x = self.ffn(x, input_ids, sp_layer)
         return x, residual, post_mix, res_mix
 
 
@@ -1126,6 +1216,10 @@ class DeepseekV4Model(nn.Module):
         # fused_post_pre. After the last layer we must apply it explicitly.
         if layer is not None:
             hidden_states = layer.hc_post(hidden_states, residual, post_mix, res_mix)
+            if layer.sp_active(positions.size(0)):
+                hidden_states = _sequence_parallel_gather_nd(
+                    hidden_states, positions.size(0)
+                )
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
