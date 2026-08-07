@@ -398,6 +398,7 @@ class DeepseekCompressor(nn.Module):
             ):
                 return
             compress_norm_rope_store_fn = compress_norm_rope_store_triton
+            extra_kwargs = {}
         elif current_platform.is_xpu() and self.use_fp4_cache:
             # XPU SYCL kernel for MXFP4 indexer path (head_dim=128).
             compress_norm_rope_store_fn = compress_norm_rope_store_xpu_mxfp4

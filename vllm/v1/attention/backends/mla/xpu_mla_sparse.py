@@ -32,11 +32,10 @@ from vllm.v1.attention.ops.xpu_mla_sparse import triton_bf16_mla_sparse_interfac
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 try:
-    from flash_attn.flash_attn_interface_xpu import (
-        flash_mla_sparse_fwd as _flash_mla_sparse_fwd,
-    )
+    from xattention import _C as _flash_attn_xpu
+    from xattention import flash_mla_sparse_fwd as _flash_mla_sparse_fwd
 
-    _XATTENTION_AVAILABLE = True
+    _XATTENTION_AVAILABLE = hasattr(_flash_attn_xpu, "sparse_prefill_fwd")
 except ImportError:
     _XATTENTION_AVAILABLE = False
 
