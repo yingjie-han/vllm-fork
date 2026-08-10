@@ -161,6 +161,18 @@ class ParallelConfig:
     """Whether the deployed model is MoE (if known)."""
     enable_expert_parallel: bool = False
     """Use expert parallelism instead of tensor parallelism for MoE layers."""
+    enable_eager_sp: bool = False
+    """Enable eager (model-level) sequence parallelism. Splits all_reduce into
+    reduce_scatter + all_gather in model code so the residual stays local-chunk
+    sized. Works without torch.compile graph transformations."""
+    eager_sp_threshold: int = 256
+    """Minimum number of local tokens (per TP rank) to activate eager SP fused
+    ops (DeepSymm for MoE, AG+GEMM/GEMM+RS for linears). Below this threshold,
+    layers fall back to separate collectives."""
+    enable_eager_sp_fuse_gemm_comms: bool = False
+    """Enable fused AG+GEMM and GEMM+RS ops (via deep_symm.async_tp) in the
+    eager SP path for attention and dense MLP linear layers. Overlaps
+    communication with computation. Shares the same eager_sp_threshold."""
     enable_ep_weight_filter: bool = False
     """Skip non-local expert weights during model loading when expert
     parallelism is active.  Each rank only reads its own expert shard from

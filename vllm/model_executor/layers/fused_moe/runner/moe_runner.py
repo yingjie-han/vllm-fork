@@ -254,6 +254,7 @@ class MoERunner(MoERunnerInterface):
         router: FusedMoERouter,
         routed_experts: RoutedExperts,
         enable_dbo: bool = False,
+        enable_eager_sp: bool = False,
         gate: torch.nn.Module | None = None,
         shared_experts: torch.nn.Module | None = None,
         shared_expert_gate: torch.nn.Module | None = None,
@@ -297,6 +298,75 @@ class MoERunner(MoERunnerInterface):
 
         # For smuggling this layer into the fused moe custom op
         register_layer_for_moe_forward_op(get_current_vllm_config(), self)
+
+        # When True, the model passes a local TP chunk directly and expects
+        # the runner to handle all_gather/reduce_scatter internally via the
+        # DeepSymm SP kernel (when above fusion threshold).
+        self._eager_sp = enable_eager_sp
+        self._eager_sp_fusion_threshold = (
+            get_current_vllm_config().parallel_config.eager_sp_threshold
+            if enable_eager_sp
+            else 0
+        )
+        self._sp_local_last_call = False
+        self._sp_shared_already_reduced = False
+        # Created lazily on first SP call, or eagerly in
+        # maybe_init_modular_kernel so profiling accounts for the buffers.
+        self._sp_moe_kernel: "FusedMoEKernel | None" = None
+        tp_size = get_current_vllm_config().parallel_config.tensor_parallel_size
+        max_tokens = get_current_vllm_config().scheduler_config.max_num_batched_tokens
+        self._sp_max_tokens_per_rank = (max_tokens + tp_size - 1) // tp_size
+
+    def _create_sp_moe_kernel(self):
+        from vllm.distributed import get_tp_group
+        from vllm.distributed.device_communicators.all2all import (
+            DeepSymmAll2AllManager,
+        )
+        from vllm.model_executor.layers.fused_moe.config import (
+            FusedMoEQuantConfig,
+        )
+        from vllm.model_executor.layers.fused_moe.experts.xpu_grouped_gemm_moe import (  # noqa: E501
+            XPUGroupedGemmExperts,
+        )
+        from vllm.model_executor.layers.fused_moe.modular_kernel import (
+            FusedMoEKernel,
+        )
+        from vllm.model_executor.layers.fused_moe.prepare_finalize.deepsymm_sp import (  # noqa: E501
+            XPUDeepSymmPrepareFinalize,
+        )
+
+        tp_group = get_tp_group()
+        all2all_manager = DeepSymmAll2AllManager(
+            cpu_group=tp_group.cpu_group,
+            tp_group=tp_group.device_group,
+            max_tokens_per_rank=self._sp_max_tokens_per_rank,
+        )
+
+        prepare_finalize = XPUDeepSymmPrepareFinalize(
+            all2all_manager=all2all_manager,
+        )
+
+        # Reuse the standard kernel's quant config when it exists so the
+        # grouped GEMM sees the same int4/mxfp4 layout as the non-SP path.
+        moe_kernel = getattr(self._quant_method, "moe_kernel", None)
+        if moe_kernel is not None:
+            existing_experts = moe_kernel.fused_experts
+            quant_config = existing_experts.quant_config
+            is_int4 = getattr(existing_experts, "is_int4", False)
+            is_mxfp4 = getattr(existing_experts, "is_mxfp4", False)
+        else:
+            quant_config = FusedMoEQuantConfig.make()
+            is_int4 = False
+            is_mxfp4 = False
+
+        experts = XPUGroupedGemmExperts(
+            moe_config=self.moe_config,
+            quant_config=quant_config,
+        )
+        experts.is_int4 = is_int4
+        experts.is_mxfp4 = is_mxfp4
+
+        return FusedMoEKernel(prepare_finalize, experts)
 
     def _select_forward(self) -> Callable:
         if current_platform.is_tpu() or current_platform.is_cpu():
@@ -443,7 +513,8 @@ class MoERunner(MoERunnerInterface):
         if (
             shared_output is not None
             and not self.moe_config.is_sequence_parallel
-            and self._fused_output_is_reduced
+            and not self._sp_shared_already_reduced
+            and (self._fused_output_is_reduced or self._sp_local_last_call)
         ):
             shared_output = tensor_model_parallel_all_reduce(shared_output)
         return shared_output
@@ -465,6 +536,7 @@ class MoERunner(MoERunnerInterface):
         # - The MK already reduced the fused output itself.
         if (
             not self.moe_config.is_sequence_parallel
+            and not self._sp_local_last_call
             and (self.moe_config.tp_size > 1 or self.moe_config.ep_size > 1)
             and not self._fused_output_is_reduced
         ):
@@ -585,13 +657,23 @@ class MoERunner(MoERunnerInterface):
                 input_ids=input_ids,
             )
 
-            fused_out = self.routed_experts.forward_modular(
-                x=hidden_states,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                shared_experts=self._shared_experts,
-                shared_experts_input=shared_experts_input,
-            )
+            if self._sp_local_last_call:
+                if self._sp_moe_kernel is None:
+                    self._sp_moe_kernel = self._create_sp_moe_kernel()
+                fused_out = self.routed_experts.forward_sp(
+                    self._sp_moe_kernel,
+                    x=hidden_states,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                )
+            else:
+                fused_out = self.routed_experts.forward_modular(
+                    x=hidden_states,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    shared_experts=self._shared_experts,
+                    shared_experts_input=shared_experts_input,
+                )
 
         self._maybe_apply_shared_experts(
             shared_experts_input,
@@ -832,6 +914,28 @@ class MoERunner(MoERunnerInterface):
             else:
                 router_logits, _ = self.gate(hidden_states)
 
+        # Under eager SP the model hands us a local TP chunk. Above the fusion
+        # threshold the DeepSymm kernel does the all_gather/reduce_scatter
+        # itself; below it we expand here and reduce_scatter the routed output
+        # back. Shared experts have replicated weights either way, so their
+        # local-chunk output is already complete.
+        use_deepsymm = self._eager_sp and (
+            hidden_states.shape[0] >= self._eager_sp_fusion_threshold
+        )
+        below_threshold_eager_sp = self._eager_sp and not use_deepsymm
+        self._sp_local_last_call = use_deepsymm
+        self._sp_shared_already_reduced = self._eager_sp
+
+        if below_threshold_eager_sp:
+            from vllm.distributed import get_tp_group
+
+            hidden_states = get_tp_group().all_gather(hidden_states, dim=0)
+            router_logits = get_tp_group().all_gather(router_logits, dim=0)
+            if input_ids is not None:
+                # Hash-routed MoE selects experts from token ids; keep them in
+                # sync with the all-gathered activations.
+                input_ids = get_tp_group().all_gather(input_ids, dim=0)
+
         with self._sequence_parallel_context():
             # TODO(bnell): parts of the dispatch/combine steps will go away once
             # #32567 lands and the remaining kernels are made MKs.  The PCP
@@ -848,10 +952,23 @@ class MoERunner(MoERunnerInterface):
                 input_ids=input_ids,
             )
 
-            return self._maybe_combine(
+            result = self._maybe_combine(
                 shared_output,
                 hidden_states,
             )
+
+        if below_threshold_eager_sp:
+            from vllm.distributed import get_tp_group
+
+            self._sp_local_last_call = True
+            if isinstance(result, tuple):
+                shared_out, fused_out = result
+                fused_out = get_tp_group().reduce_scatter(fused_out, dim=0)
+                result = (shared_out, fused_out)
+            else:
+                result = get_tp_group().reduce_scatter(result, dim=0)
+
+        return result
 
     #########################################################
     #
@@ -864,6 +981,10 @@ class MoERunner(MoERunnerInterface):
     # This is called after all weight loading and post-processing, so it
     # should be safe to swap out the quant_method.
     def maybe_init_modular_kernel(self) -> None:
+        # Allocate the SymmBuffer before KV cache profiling.
+        if self._eager_sp and self._sp_moe_kernel is None:
+            self._sp_moe_kernel = self._create_sp_moe_kernel()
+
         # NOTE(rob): WIP refactor. For quant methods that own the MK
         # we create the MK during process_weights_after_loading.
         if (
