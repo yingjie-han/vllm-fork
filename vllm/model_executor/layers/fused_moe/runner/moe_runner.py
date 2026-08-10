@@ -13,6 +13,7 @@ from vllm.distributed import (
     get_ep_group,
     get_pcp_group,
     tensor_model_parallel_all_reduce,
+    tensor_model_parallel_reduce_scatter,
 )
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.forward_context import (
@@ -241,6 +242,11 @@ class MoERunner(MoERunnerInterface):
     for different configurations (e.g., with/without shared experts, gates, etc.).
     """
 
+    # Set per-forward by callers that feed us an all-gathered chunk (DSv4
+    # layer-wide SP): turns the final all-reduce into a reduce-scatter so the
+    # caller gets its own chunk back without moving the full batch twice.
+    sp_external_reduce_scatter = False
+
     def __init__(
         self,
         layer_name: str,
@@ -408,6 +414,20 @@ class MoERunner(MoERunnerInterface):
             and self._quant_method.moe_kernel.output_is_reduced()
         )
 
+    @property
+    def sp_external_reduce_scatter_ok(self) -> bool:
+        """Whether a caller feeding us an all-gathered chunk may ask for the
+        final all-reduce to be turned into a reduce-scatter.
+
+        Only valid on the "late" reduce path, where the combined
+        shared+fused sum is still a partial sum owned by this rank.
+        """
+        return (
+            not self.moe_config.is_sequence_parallel
+            and self.moe_config.tp_size > 1
+            and not self._fused_output_is_reduced
+        )
+
     def _maybe_reduce_shared_expert_output(
         self,
         shared_output: torch.Tensor | None,
@@ -448,7 +468,10 @@ class MoERunner(MoERunnerInterface):
             and (self.moe_config.tp_size > 1 or self.moe_config.ep_size > 1)
             and not self._fused_output_is_reduced
         ):
-            states = tensor_model_parallel_all_reduce(states)
+            if self.sp_external_reduce_scatter:
+                states = tensor_model_parallel_reduce_scatter(states, 0)
+            else:
+                states = tensor_model_parallel_all_reduce(states)
 
         return states[..., :trunc_size] if trunc_size is not None else states
 
