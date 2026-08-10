@@ -631,6 +631,10 @@ _SP_LAYER_BOUNDARY = os.environ.get("VLLM_DSV4_SP_LAYER", "0") == "1"
 # the extra chunk/gather launches cost more than the elementwise work they save.
 _SP_LAYER_MIN_TOKENS = int(os.environ.get("VLLM_DSV4_SP_LAYER_MIN_TOKENS", "128"))
 
+# Inside the SP domain the MoE output only needs to come back as the local
+# chunk, so the runner's final all-reduce can be a reduce-scatter instead.
+_SP_MOE_REDUCE_SCATTER = os.environ.get("VLLM_DSV4_SP_MOE_RS", "1") == "1"
+
 
 class DeepseekV4MoE(nn.Module):
     def __init__(
@@ -839,6 +843,16 @@ class DeepseekV4MoE(nn.Module):
         if sp_external is None:
             sp_external = self.sp_chunk_external
 
+        # When the runner's final reduction is still the "late" all-reduce over
+        # the shared+fused sum, we can ask it for a reduce-scatter instead and
+        # skip both the slice and half the output traffic.
+        sp_reduce_scatter = (
+            sp_external
+            and _SP_MOE_REDUCE_SCATTER
+            and self.experts.sp_external_reduce_scatter_ok
+        )
+        self.experts.sp_external_reduce_scatter = sp_reduce_scatter
+
         if sp_external:
             # Routed experts are TP-sharded over experts, so they need every
             # token: expand the local chunk back to the (padded) full batch and
@@ -862,7 +876,7 @@ class DeepseekV4MoE(nn.Module):
                 input_ids=input_ids,
             )
 
-        if sp_external:
+        if sp_external and not sp_reduce_scatter:
             final_hidden_states = final_hidden_states.narrow(
                 0, get_tensor_model_parallel_rank() * chunk_len, chunk_len
             )
