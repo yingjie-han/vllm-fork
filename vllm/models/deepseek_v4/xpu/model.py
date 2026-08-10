@@ -638,6 +638,10 @@ _SP_MOE_REDUCE_SCATTER = os.environ.get("VLLM_DSV4_SP_MOE_RS", "1") == "1"
 # Same idea for the attention output: inside the SP domain `o_proj` is followed
 # immediately by the chunk, so reduce-scatter straight into it.
 _SP_ATTN_REDUCE_SCATTER = os.environ.get("VLLM_DSV4_SP_ATTN_RS", "1") == "1"
+# Hand the MoE runner the local chunk and let DeepSymm fuse the all_gather into
+# the expert permute and the reduce_scatter into the unpermute.
+_SP_MOE_DEEPSYMM = os.environ.get("VLLM_DSV4_DEEPSYMM", "0") == "1"
+_SP_MOE_DEEPSYMM_MIN_TOKENS = os.environ.get("VLLM_DSV4_DEEPSYMM_MIN_TOKENS")
 
 
 class DeepseekV4MoE(nn.Module):
@@ -659,6 +663,11 @@ class DeepseekV4MoE(nn.Module):
         # When set, the caller hands us the local token chunk and expects a
         # chunked result back. MegaMoE has its own EP scheme, so it opts out.
         self.sp_chunk_external = sp_chunk_external and not self.use_mega_moe
+        self.enable_eager_sp = self.sp_chunk_external and _SP_MOE_DEEPSYMM
+        if self.enable_eager_sp and _SP_MOE_DEEPSYMM_MIN_TOKENS is not None:
+            vllm_config.parallel_config.eager_sp_threshold = int(
+                _SP_MOE_DEEPSYMM_MIN_TOKENS
+            )
         if self.use_mega_moe and not vllm_config.parallel_config.enable_expert_parallel:
             raise NotImplementedError(
                 "DeepSeek V4 MegaMoE currently requires expert parallel. "
@@ -729,6 +738,9 @@ class DeepseekV4MoE(nn.Module):
                 swiglu_limit=self.swiglu_limit,
                 quant_config=quant_config,
                 reduce_results=self.use_mega_moe,
+                # Under eager SP the shared expert sees only the local token
+                # chunk, so its weights must be replicated (no TP all-reduce).
+                is_sequence_parallel=self.enable_eager_sp,
                 prefix=f"{prefix}.shared_experts",
             )
 
@@ -791,6 +803,7 @@ class DeepseekV4MoE(nn.Module):
             hash_indices_table=self.gate.tid2eid,
             swiglu_limit=self.swiglu_limit,
             router_logits_dtype=torch.float32,
+            runner_args={"enable_eager_sp": self.enable_eager_sp},
         )
 
     def forward(
@@ -852,12 +865,15 @@ class DeepseekV4MoE(nn.Module):
         # skip both the slice and half the output traffic.
         sp_reduce_scatter = (
             sp_external
+            and not self.enable_eager_sp
             and _SP_MOE_REDUCE_SCATTER
             and self.experts.sp_external_reduce_scatter_ok
         )
         self.experts.sp_external_reduce_scatter = sp_reduce_scatter
 
-        if sp_external:
+        # Eager SP: the runner consumes the local chunk and returns one, so it
+        # owns both collectives and we must not gather/slice around it.
+        if sp_external and not self.enable_eager_sp:
             # Routed experts are TP-sharded over experts, so they need every
             # token: expand the local chunk back to the (padded) full batch and
             # slice our chunk out of the reduced result.
@@ -880,7 +896,7 @@ class DeepseekV4MoE(nn.Module):
                 input_ids=input_ids,
             )
 
-        if sp_external and not sp_reduce_scatter:
+        if sp_external and not self.enable_eager_sp and not sp_reduce_scatter:
             final_hidden_states = final_hidden_states.narrow(
                 0, get_tensor_model_parallel_rank() * chunk_len, chunk_len
             )

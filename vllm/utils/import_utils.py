@@ -482,6 +482,11 @@ def has_deep_gemm() -> bool:
     return _has_module("deep_gemm") or _has_module("vllm.third_party.deep_gemm")
 
 
+def has_deep_symm() -> bool:
+    """Whether the optional `deep_symm` package is available."""
+    return _has_module("deep_symm")
+
+
 def has_nixl_ep() -> bool:
     """Whether the optional `nixl_ep` package is available."""
     return _has_module("nixl_ep")
