@@ -635,6 +635,10 @@ _SP_LAYER_MIN_TOKENS = int(os.environ.get("VLLM_DSV4_SP_LAYER_MIN_TOKENS", "128"
 # chunk, so the runner's final all-reduce can be a reduce-scatter instead.
 _SP_MOE_REDUCE_SCATTER = os.environ.get("VLLM_DSV4_SP_MOE_RS", "1") == "1"
 
+# Same idea for the attention output: inside the SP domain `o_proj` is followed
+# immediately by the chunk, so reduce-scatter straight into it.
+_SP_ATTN_REDUCE_SCATTER = os.environ.get("VLLM_DSV4_SP_ATTN_RS", "1") == "1"
+
 
 class DeepseekV4MoE(nn.Module):
     def __init__(
@@ -919,6 +923,12 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
         self.tp_size = get_tensor_model_parallel_world_size()
         self.sp_layer = self.ffn.sp_chunk_external and self.tp_size > 1
+        self.sp_attn_rs = self.sp_layer and _SP_ATTN_REDUCE_SCATTER
+        if self.sp_attn_rs:
+            # `_o_proj` takes over the reduction so it can pick all-reduce or
+            # reduce-scatter per batch.
+            self.attn.wo_b.reduce_results = False
+            self.attn.sp_external_reduce = True
 
         self.attn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
         self.ffn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
@@ -1048,10 +1058,13 @@ class DeepseekV4DecoderLayer(nn.Module):
                 # MHC state stays chunked; only attention needs all tokens.
                 x = tensor_model_parallel_all_gather(x, 0)[: positions.size(0)]
 
+        if self.sp_attn_rs:
+            self.attn.sp_reduce_scatter_out = sp_layer
         x = self.attn(positions, x, None)
 
         if sp_layer:
-            x = sequence_parallel_chunk(x)
+            if not self.sp_attn_rs:
+                x = sequence_parallel_chunk(x)
             if chunk_mhc_state:
                 residual = _sequence_parallel_chunk_nd(residual)
                 post_mix = _sequence_parallel_chunk_nd(post_mix)

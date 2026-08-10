@@ -21,6 +21,11 @@ from typing import TYPE_CHECKING, cast
 
 import torch
 
+from vllm.distributed import (
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+    tensor_model_parallel_reduce_scatter,
+)
 from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
 from vllm.models.deepseek_v4.common.ops import (
@@ -69,6 +74,12 @@ class DeepseekV4XPUAttention(DeepseekV4Attention):
 
     backend_cls = DeepseekV4XPUSparseBackend
     use_flashmla_fp8_layout = True
+
+    # Set by the DSv4 layer-wide SP path (see xpu/model.py): `wo_b` then keeps
+    # its partial sum and `_o_proj` performs the reduction itself, so a batch
+    # inside the SP domain can reduce-scatter straight into the local chunk.
+    sp_external_reduce = False
+    sp_reduce_scatter_out = False
 
     def __init__(self, *args, **kwargs) -> None:
         # torch.cuda.Event() raises RuntimeError on XPU ("dummy base class").
@@ -121,7 +132,20 @@ class DeepseekV4XPUAttention(DeepseekV4Attention):
         )
         wo_a_weight = self._get_wo_a_bf16(o_inv.shape[-1])
         z = torch.einsum("tgd,grd->tgr", o_inv, wo_a_weight)
-        return self.wo_b(z.flatten(1))
+        out = self.wo_b(z.flatten(1))
+        if self.sp_external_reduce:
+            out = self._reduce_o_proj(out)
+        return out
+
+    def _reduce_o_proj(self, out: torch.Tensor) -> torch.Tensor:
+        """Reduce the `wo_b` partial sum that `reduce_results=False` left us."""
+        if not self.sp_reduce_scatter_out:
+            return tensor_model_parallel_all_reduce(out)
+        tp_size = get_tensor_model_parallel_world_size()
+        remainder = out.size(0) % tp_size
+        if remainder != 0:
+            out = torch.nn.functional.pad(out, (0, 0, 0, tp_size - remainder))
+        return tensor_model_parallel_reduce_scatter(out, 0)
 
     def _get_wo_a_bf16(self, hidden_dim: int) -> torch.Tensor:
         """Dequantize wo_a weight to bf16 once and cache on the module."""
