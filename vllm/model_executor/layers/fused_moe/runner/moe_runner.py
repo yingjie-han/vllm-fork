@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Callable, Iterable
 from contextlib import nullcontext
 from typing import TYPE_CHECKING
@@ -56,6 +57,11 @@ from vllm.utils.torch_utils import (
 )
 
 logger = init_logger(__name__)
+
+# Debug aid for the eager-SP threshold: logs each distinct (local tokens, branch)
+# pair once so a run can be checked against the intended path.
+_SP_DEBUG = os.environ.get("VLLM_DSV4_SP_DEBUG", "0") == "1"
+_sp_debug_seen: set[tuple[int, bool]] = set()
 
 
 def register_layer_for_moe_forward_op(
@@ -923,6 +929,16 @@ class MoERunner(MoERunnerInterface):
             hidden_states.shape[0] >= self._eager_sp_fusion_threshold
         )
         below_threshold_eager_sp = self._eager_sp and not use_deepsymm
+        if _SP_DEBUG and self._eager_sp:
+            key = (hidden_states.shape[0], use_deepsymm)
+            if key not in _sp_debug_seen:
+                _sp_debug_seen.add(key)
+                logger.info(
+                    "[dsv4-sp] local_tokens=%d threshold=%d deepsymm=%s",
+                    hidden_states.shape[0],
+                    self._eager_sp_fusion_threshold,
+                    use_deepsymm,
+                )
         self._sp_local_last_call = use_deepsymm
         self._sp_shared_already_reduced = self._eager_sp
 
