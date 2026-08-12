@@ -870,6 +870,9 @@ class DeepseekV4MoE(nn.Module):
             and self.experts.sp_external_reduce_scatter_ok
         )
         self.experts.sp_external_reduce_scatter = sp_reduce_scatter
+        # Tell the runner whether it is getting a local chunk or the full batch;
+        # sp_active() can turn the SP domain off for a step (small batches).
+        self.experts.sp_external_chunked = sp_external
 
         # Eager SP: the runner consumes the local chunk and returns one, so it
         # owns both collectives and we must not gather/slice around it.
