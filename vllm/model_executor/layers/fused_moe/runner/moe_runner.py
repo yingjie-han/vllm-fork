@@ -253,6 +253,10 @@ class MoERunner(MoERunnerInterface):
     # caller gets its own chunk back without moving the full batch twice.
     sp_external_reduce_scatter = False
 
+    # Set per-forward by DSv4: False means the layer stayed outside the SP
+    # domain this step and handed us the full batch instead of a local chunk.
+    sp_external_chunked = True
+
     def __init__(
         self,
         layer_name: str,
@@ -925,19 +929,25 @@ class MoERunner(MoERunnerInterface):
         # itself; below it we expand here and reduce_scatter the routed output
         # back. Shared experts have replicated weights either way, so their
         # local-chunk output is already complete.
-        use_deepsymm = self._eager_sp and (
+        # When the layer skipped the SP domain this step it gives us the full
+        # batch, so there is nothing to expand -- all-reducing the routed output
+        # is enough, and all_gathering would replicate it tp_size times.
+        eager_sp_chunk = self._eager_sp and self.sp_external_chunked
+        eager_sp_global = self._eager_sp and not self.sp_external_chunked
+        use_deepsymm = eager_sp_chunk and (
             hidden_states.shape[0] >= self._eager_sp_fusion_threshold
         )
-        below_threshold_eager_sp = self._eager_sp and not use_deepsymm
+        below_threshold_eager_sp = eager_sp_chunk and not use_deepsymm
         if _SP_DEBUG and self._eager_sp:
-            key = (hidden_states.shape[0], use_deepsymm)
+            key = (hidden_states.shape[0], use_deepsymm, eager_sp_global)
             if key not in _sp_debug_seen:
                 _sp_debug_seen.add(key)
                 logger.info(
-                    "[dsv4-sp] local_tokens=%d threshold=%d deepsymm=%s",
+                    "[dsv4-sp] tokens=%d threshold=%d deepsymm=%s sp_chunked=%s",
                     hidden_states.shape[0],
                     self._eager_sp_fusion_threshold,
                     use_deepsymm,
+                    self.sp_external_chunked,
                 )
         self._sp_local_last_call = use_deepsymm
         self._sp_shared_already_reduced = self._eager_sp
@@ -983,6 +993,14 @@ class MoERunner(MoERunnerInterface):
                 result = (shared_out, fused_out)
             else:
                 result = get_tp_group().reduce_scatter(result, dim=0)
+        elif eager_sp_global and self.moe_config.tp_size > 1:
+            # is_sequence_parallel suppresses the runner's own reduction paths,
+            # so the routed partial sums must be all-reduced here.
+            if isinstance(result, tuple):
+                shared_out, fused_out = result
+                result = (shared_out, tensor_model_parallel_all_reduce(fused_out))
+            else:
+                result = tensor_model_parallel_all_reduce(result)
 
         return result
 
