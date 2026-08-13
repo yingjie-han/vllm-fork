@@ -116,6 +116,42 @@ class DeepseekV4MLP(nn.Module):
         return x
 
 
+class DeepseekV4SPSharedExperts(nn.Module):
+    """Dispatches to one of two weight copies of the same shared expert.
+
+    The DeepSymm fused path only ever sees the local token chunk, so it needs
+    a replicated copy. Every other eager-SP path sees the full batch and can
+    use a TP-sharded copy, folding its partial sum into a collective that is
+    already happening. The runner flips ``use_sharded`` per step.
+    """
+
+    def __init__(self, replicated: nn.Module, sharded: nn.Module) -> None:
+        super().__init__()
+        # Deliberately kept out of the module tree: both copies are already
+        # registered on the parent, and a second registration would make
+        # process_weights_after_loading run twice over the same parameters.
+        object.__setattr__(self, "_replicated", replicated)
+        object.__setattr__(self, "_sharded", sharded)
+        self.use_sharded = False
+
+    def forward(self, x):
+        out = self._sharded(x) if self.use_sharded else self._replicated(x)
+        if _SP_SHARED_CHECK and self.use_sharded:
+            from vllm.distributed import tensor_model_parallel_all_reduce
+
+            ref = self._replicated(x)
+            got = tensor_model_parallel_all_reduce(out.clone())
+            print(
+                "[dsv4-sp] shardcheck maxdiff=%.4e refmax=%.4e"
+                % (
+                    (got.float() - ref.float()).abs().max().item(),
+                    ref.float().abs().max().item(),
+                ),
+                flush=True,
+            )
+        return out
+
+
 @triton.jit
 def _deepseek_v4_stage_mega_moe_inputs_kernel(
     hidden_states,
@@ -643,6 +679,13 @@ _SP_ATTN_REDUCE_SCATTER = os.environ.get("VLLM_DSV4_SP_ATTN_RS", "1") == "1"
 _SP_MOE_DEEPSYMM = os.environ.get("VLLM_DSV4_DEEPSYMM", "0") == "1"
 _SP_MOE_DEEPSYMM_MIN_TOKENS = os.environ.get("VLLM_DSV4_DEEPSYMM_MIN_TOKENS")
 
+# Keep a second, TP-sharded copy of the shared expert for the eager-SP steps
+# that do not reach the DeepSymm fused path, so they stop re-reading the whole
+# replicated weight on every rank.
+_SP_SHARED_TP = os.environ.get("VLLM_DSV4_SP_SHARED_TP", "1") == "1"
+# Debug-only: verify the derived shard reproduces the replicated expert.
+_SP_SHARED_CHECK = os.environ.get("VLLM_DSV4_SP_SHARED_CHECK", "0") == "1"
+
 
 class DeepseekV4MoE(nn.Module):
     def __init__(
@@ -728,6 +771,8 @@ class DeepseekV4MoE(nn.Module):
 
         if config.n_shared_experts is None:
             self.shared_experts = None
+            self.shared_experts_tp = None
+            self._shared_experts_module = None
         else:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
 
@@ -743,6 +788,23 @@ class DeepseekV4MoE(nn.Module):
                 is_sequence_parallel=self.enable_eager_sp,
                 prefix=f"{prefix}.shared_experts",
             )
+            self.shared_experts_tp = None
+            self._shared_experts_module = self.shared_experts
+            if self.enable_eager_sp and _SP_SHARED_TP and self.tp_size > 1:
+                self.shared_experts_tp = DeepseekV4MLP(
+                    hidden_size=config.hidden_size,
+                    intermediate_size=intermediate_size,
+                    hidden_act=config.hidden_act,
+                    swiglu_limit=self.swiglu_limit,
+                    quant_config=quant_config,
+                    # Partial sums are folded into the SP collective instead.
+                    reduce_results=False,
+                    is_sequence_parallel=False,
+                    prefix=f"{prefix}.shared_experts_tp",
+                )
+                self._shared_experts_module = DeepseekV4SPSharedExperts(
+                    self.shared_experts, self.shared_experts_tp
+                )
 
         if self.use_mega_moe:
             self._init_mega_moe_experts(vllm_config, config, prefix)
@@ -788,7 +850,7 @@ class DeepseekV4MoE(nn.Module):
         self.experts_start_idx = self.tp_rank * self.n_local_experts
         self.experts_end_idx = self.experts_start_idx + self.n_local_experts
         self.experts = FusedMoE(
-            shared_experts=self.shared_experts,
+            shared_experts=self._shared_experts_module,
             gate=self.gate,
             num_experts=config.n_routed_experts,
             top_k=config.num_experts_per_tok,
@@ -905,6 +967,47 @@ class DeepseekV4MoE(nn.Module):
             )
 
         return final_hidden_states.view(org_shape)
+
+    def post_load_weights(self) -> None:
+        """Derive the TP-sharded shared-expert copy from the replicated one.
+
+        Runs before the quant kernels repack weights, so both copies still use
+        the plain [out, in] / [out/blk, in/blk] layout and a plain narrow is a
+        valid shard.
+        """
+        if self.shared_experts_tp is None:
+            return
+        tp_rank = get_tensor_model_parallel_rank()
+        if _SP_SHARED_CHECK:
+            # Dummy weights make the shared expert output underflow to zero,
+            # which would hide any sharding bug, so refill with values the
+            # kernel can actually see before deriving the shard.
+            for mod in (self.shared_experts.gate_up_proj,
+                        self.shared_experts.down_proj):
+                w = mod.weight
+                w.data.copy_(torch.randn(w.shape, device=w.device).to(w.dtype))
+                sc = getattr(mod, "weight_scale_inv", None)
+                if sc is not None:
+                    sc.data.copy_(torch.ones_like(sc.data.float()).to(sc.dtype))
+
+        def copy_shard(src_mod, dst_mod, dim: int, halves: int) -> None:
+            for name in ("weight", "weight_scale_inv", "weight_scale"):
+                src = getattr(src_mod, name, None)
+                dst = getattr(dst_mod, name, None)
+                if src is None or dst is None:
+                    continue
+                shard = dst.shape[dim] // halves
+                stride = src.shape[dim] // halves
+                for h in range(halves):
+                    dst.data.narrow(dim, h * shard, shard).copy_(
+                        src.data.narrow(dim, h * stride + tp_rank * shard, shard)
+                    )
+
+        # gate_up_proj stacks [gate; up] on the output dim; down_proj is
+        # sharded on its input dim.
+        tp = self.shared_experts_tp
+        copy_shard(self.shared_experts.gate_up_proj, tp.gate_up_proj, 0, 2)
+        copy_shard(self.shared_experts.down_proj, tp.down_proj, 1, 1)
 
     def finalize_mega_moe_weights(self) -> None:
         if self.use_mega_moe:

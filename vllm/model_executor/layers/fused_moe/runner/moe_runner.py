@@ -320,6 +320,7 @@ class MoERunner(MoERunnerInterface):
         )
         self._sp_local_last_call = False
         self._sp_shared_already_reduced = False
+        self._sp_deferred_reduce: str | None = None
         # Created lazily on first SP call, or eagerly in
         # maybe_init_modular_kernel so profiling accounts for the buffers.
         self._sp_moe_kernel: "FusedMoEKernel | None" = None
@@ -544,7 +545,16 @@ class MoERunner(MoERunnerInterface):
         # We don't need to reduce the final output if:
         # - We are not running with TP or DP
         # - The MK already reduced the fused output itself.
-        if (
+        if self._sp_deferred_reduce is not None:
+            # Eager SP with a TP-sharded shared expert: routed and shared are
+            # partial sums over the same rows, so they ride one collective.
+            mode = self._sp_deferred_reduce
+            self._sp_deferred_reduce = None
+            if mode == "rs":
+                states = tensor_model_parallel_reduce_scatter(states, 0)
+            else:
+                states = tensor_model_parallel_all_reduce(states)
+        elif (
             not self.moe_config.is_sequence_parallel
             and not self._sp_local_last_call
             and (self.moe_config.tp_size > 1 or self.moe_config.ep_size > 1)
@@ -938,6 +948,21 @@ class MoERunner(MoERunnerInterface):
             hidden_states.shape[0] >= self._eager_sp_fusion_threshold
         )
         below_threshold_eager_sp = eager_sp_chunk and not use_deepsymm
+
+        # Outside the DeepSymm path every rank ends up holding the same full
+        # batch, so the shared expert can use its TP-sharded copy and let its
+        # partial sum ride along in the collective we already pay for.
+        shared_layer = getattr(self._shared_experts, "_layer", None)
+        sharded_shared = (
+            self._eager_sp
+            and not use_deepsymm
+            and self.moe_config.tp_size > 1
+            and hasattr(shared_layer, "use_sharded")
+            and (eager_sp_global or shared_experts_input is hidden_states)
+        )
+        if shared_layer is not None and hasattr(shared_layer, "use_sharded"):
+            shared_layer.use_sharded = sharded_shared
+
         if _SP_DEBUG and self._eager_sp:
             key = (hidden_states.shape[0], use_deepsymm, eager_sp_global)
             if key not in _sp_debug_seen:
@@ -961,6 +986,9 @@ class MoERunner(MoERunnerInterface):
                 # Hash-routed MoE selects experts from token ids; keep them in
                 # sync with the all-gathered activations.
                 input_ids = get_tp_group().all_gather(input_ids, dim=0)
+            if sharded_shared:
+                # Same tensor pre-gather, so this costs no extra collective.
+                shared_experts_input = hidden_states
 
         with self._sequence_parallel_context():
             # TODO(bnell): parts of the dispatch/combine steps will go away once
@@ -987,7 +1015,10 @@ class MoERunner(MoERunnerInterface):
             from vllm.distributed import get_tp_group
 
             self._sp_local_last_call = True
-            if isinstance(result, tuple):
+            if sharded_shared:
+                # Deferred so the shared partial sum can join this collective.
+                self._sp_deferred_reduce = "rs"
+            elif isinstance(result, tuple):
                 shared_out, fused_out = result
                 fused_out = get_tp_group().reduce_scatter(fused_out, dim=0)
                 result = (shared_out, fused_out)
@@ -996,7 +1027,9 @@ class MoERunner(MoERunnerInterface):
         elif eager_sp_global and self.moe_config.tp_size > 1:
             # is_sequence_parallel suppresses the runner's own reduction paths,
             # so the routed partial sums must be all-reduced here.
-            if isinstance(result, tuple):
+            if sharded_shared:
+                self._sp_deferred_reduce = "ar"
+            elif isinstance(result, tuple):
                 shared_out, fused_out = result
                 result = (shared_out, tensor_model_parallel_all_reduce(fused_out))
             else:

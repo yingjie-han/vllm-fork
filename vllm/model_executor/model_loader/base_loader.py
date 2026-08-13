@@ -72,6 +72,14 @@ class BaseModelLoader(ABC):
                     format_gib(peak_memory),
                 )
 
+            # Give modules a chance to derive extra parameter copies from the
+            # freshly loaded values, before kernels repack them. Runs for the
+            # dummy loader too, unlike the model's own load_weights().
+            for module in model.modules():
+                hook = getattr(module, "post_load_weights", None)
+                if hook is not None:
+                    hook()
+
             # Process weights into kernel format. Note that when using online
             # quantization, weights are (typically) quantized as they are loaded.
             if _has_online_quant(model):
