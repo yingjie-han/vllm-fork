@@ -90,6 +90,7 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
+from vllm.utils.import_utils import has_deep_symm
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.mla.indexer import (
@@ -258,6 +259,11 @@ _SP_LAYER_MIN_TOKENS = int(os.environ.get("VLLM_GLM_SP_LAYER_MIN_TOKENS", "128")
 # chunk, so the runner's final all-reduce can become a reduce-scatter.
 _SP_MOE_REDUCE_SCATTER = os.environ.get("VLLM_GLM_SP_MOE_RS", "1") == "1"
 
+# Hand the local chunk straight to DeepSymm, which folds the all-gather into
+# the expert permute and the reduce-scatter into the unpermute, so the MoE
+# costs no standalone collective at all. Requires the SP domain to be on.
+_SP_MOE_DEEPSYMM = os.environ.get("VLLM_GLM_DEEPSYMM", "0") == "1"
+
 
 def _sp_gather(x: torch.Tensor, num_tokens: int) -> torch.Tensor:
     """Inverse of `sequence_parallel_chunk` (drops the chunk padding)."""
@@ -280,6 +286,9 @@ class DeepseekV2MoE(nn.Module):
         # When set, the caller hands us the local token chunk and expects a
         # chunked result back.
         self.sp_chunk_external = sp_chunk_external
+        self.enable_eager_sp = (
+            sp_chunk_external and _SP_MOE_DEEPSYMM and has_deep_symm()
+        )
 
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
 
@@ -290,6 +299,9 @@ class DeepseekV2MoE(nn.Module):
         self.n_shared_experts: int = config.n_shared_experts
 
         self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
+        # DeepSymm consumes chunked rows, which is the same contract the
+        # upstream sequence-parallel MoE presents to its submodules.
+        self.sp_moe = self.is_sequence_parallel or self.enable_eager_sp
 
         if config.hidden_act != "silu":
             raise ValueError(
@@ -344,7 +356,7 @@ class DeepseekV2MoE(nn.Module):
                 intermediate_size=intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
-                is_sequence_parallel=self.is_sequence_parallel,
+                is_sequence_parallel=self.sp_moe,
                 reduce_results=False,
                 prefix=f"{prefix}.shared_experts",
             )
@@ -369,11 +381,12 @@ class DeepseekV2MoE(nn.Module):
             e_score_correction_bias=self.gate.e_score_correction_bias,
             enable_eplb=self.enable_eplb,
             num_redundant_experts=self.n_redundant_experts,
-            is_sequence_parallel=self.is_sequence_parallel,
+            is_sequence_parallel=self.sp_moe,
             n_shared_experts=config.n_shared_experts
             if self.is_fusion_moe_shared_experts_enabled
             else None,
             router_logits_dtype=self.gate.out_dtype,
+            runner_args={"enable_eager_sp": self.enable_eager_sp},
         )
 
         if (
@@ -399,20 +412,22 @@ class DeepseekV2MoE(nn.Module):
         # all-reduce over the full batch. Inside the SP domain we only need the
         # local chunk back, so ask the runner for a reduce-scatter instead --
         # same latency class, half the payload, and it replaces the slice below.
+        # DeepSymm needs neither: it fuses both collectives into the permute.
         sp_reduce_scatter = (
             sp_external
+            and not self.enable_eager_sp
             and _SP_MOE_REDUCE_SCATTER
             and self.experts.sp_external_reduce_scatter_ok
         )
-        if sp_external:
-            self.experts.sp_external_reduce_scatter = sp_reduce_scatter
+        self.experts.sp_external_reduce_scatter = sp_reduce_scatter
+        self.experts.sp_external_chunked = sp_external
 
         chunk_len = hidden_states.size(0)
-        if sp_external:
+        if sp_external and not self.enable_eager_sp:
             # Sharded experts need every token: expand the local chunk back to
             # the padded full batch.
             hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
-        elif self.is_sequence_parallel:
+        elif self.is_sequence_parallel and not self.enable_eager_sp:
             # Chunk the hidden states so they aren't replicated across TP ranks.
             # This avoids duplicate computation in self.experts.
             hidden_states = sequence_parallel_chunk(hidden_states)
@@ -428,14 +443,13 @@ class DeepseekV2MoE(nn.Module):
             )
 
         if sp_external:
-            self.experts.sp_external_reduce_scatter = False
-            if not sp_reduce_scatter:
+            if not self.enable_eager_sp and not sp_reduce_scatter:
                 final_hidden_states = final_hidden_states.narrow(
                     0, self.tp_rank * chunk_len, chunk_len
                 )
             return final_hidden_states.view(chunk_len, hidden_dim)
 
-        if self.is_sequence_parallel:
+        if self.is_sequence_parallel and not self.enable_eager_sp:
             final_hidden_states = tensor_model_parallel_all_gather(
                 final_hidden_states, 0
             )
