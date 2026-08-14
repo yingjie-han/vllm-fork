@@ -1378,6 +1378,20 @@ class DeepseekV2Model(nn.Module):
             prefix=f"{prefix}.layers",
         )
 
+        if _SP_LAYER_BOUNDARY:
+            sp_layers = [
+                i for i, layer in enumerate(self.layers) if getattr(layer, "sp_layer", False)
+            ]
+            logger.info(
+                "GLM SP domain: layers %s of %d chunked "
+                "(min_tokens=%d, moe_rs=%s, deepsymm=%s)",
+                sp_layers,
+                len(self.layers),
+                _SP_LAYER_MIN_TOKENS,
+                _SP_MOE_REDUCE_SCATTER,
+                _SP_MOE_DEEPSYMM and has_deep_symm(),
+            )
+
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
