@@ -24,6 +24,7 @@
 # limitations under the License.
 """Inference-only DeepseekV2/DeepseekV3 model."""
 
+import os
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -243,6 +244,26 @@ class DeepseekV2MLP(nn.Module):
         return x
 
 
+# Opt-in (GLM-5.2 / XPU): run everything in the decoder layer except attention
+# on the local token chunk, so the norms and the residual stop being replicated
+# across TP ranks. The residual then stays chunked across layers and only the
+# attention input is all-gathered, keeping the collective count unchanged.
+_SP_LAYER_BOUNDARY = os.environ.get("VLLM_GLM_SP_LAYER", "0") == "1"
+
+# Total tokens in the batch below which the wider SP domain is not worth it:
+# the extra chunk/gather launches cost more than the elementwise work they save.
+_SP_LAYER_MIN_TOKENS = int(os.environ.get("VLLM_GLM_SP_LAYER_MIN_TOKENS", "128"))
+
+# Inside the SP domain the MoE output only needs to come back as the local
+# chunk, so the runner's final all-reduce can become a reduce-scatter.
+_SP_MOE_REDUCE_SCATTER = os.environ.get("VLLM_GLM_SP_MOE_RS", "1") == "1"
+
+
+def _sp_gather(x: torch.Tensor, num_tokens: int) -> torch.Tensor:
+    """Inverse of `sequence_parallel_chunk` (drops the chunk padding)."""
+    return tensor_model_parallel_all_gather(x, 0)[:num_tokens]
+
+
 class DeepseekV2MoE(nn.Module):
     def __init__(
         self,
@@ -250,10 +271,15 @@ class DeepseekV2MoE(nn.Module):
         parallel_config: ParallelConfig,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        sp_chunk_external: bool = False,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
+
+        # When set, the caller hands us the local token chunk and expects a
+        # chunked result back.
+        self.sp_chunk_external = sp_chunk_external
 
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
 
@@ -358,15 +384,37 @@ class DeepseekV2MoE(nn.Module):
                 self.gate.e_score_correction_bias.data.to(self.gate.out_dtype)
             )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        sp_external: bool | None = None,
+    ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        # Chunk the hidden states so they aren't replicated across TP ranks.
-        # This avoids duplicate computation in self.experts.
-        # TODO: We can replace the all_reduce at the end of attn with a
-        # reduce_scatter instead of chunking here.
-        if self.is_sequence_parallel:
+        if sp_external is None:
+            sp_external = self.sp_chunk_external
+
+        # The routed experts are TP-sharded, so their final reduction is an
+        # all-reduce over the full batch. Inside the SP domain we only need the
+        # local chunk back, so ask the runner for a reduce-scatter instead --
+        # same latency class, half the payload, and it replaces the slice below.
+        sp_reduce_scatter = (
+            sp_external
+            and _SP_MOE_REDUCE_SCATTER
+            and self.experts.sp_external_reduce_scatter_ok
+        )
+        if sp_external:
+            self.experts.sp_external_reduce_scatter = sp_reduce_scatter
+
+        chunk_len = hidden_states.size(0)
+        if sp_external:
+            # Sharded experts need every token: expand the local chunk back to
+            # the padded full batch.
+            hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
+        elif self.is_sequence_parallel:
+            # Chunk the hidden states so they aren't replicated across TP ranks.
+            # This avoids duplicate computation in self.experts.
             hidden_states = sequence_parallel_chunk(hidden_states)
 
         if self.experts.is_internal_router:
@@ -378,6 +426,14 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states = self.experts(
                 hidden_states=hidden_states, router_logits=router_logits
             )
+
+        if sp_external:
+            self.experts.sp_external_reduce_scatter = False
+            if not sp_reduce_scatter:
+                final_hidden_states = final_hidden_states.narrow(
+                    0, self.tp_rank * chunk_len, chunk_len
+                )
+            return final_hidden_states.view(chunk_len, hidden_dim)
 
         if self.is_sequence_parallel:
             final_hidden_states = tensor_model_parallel_all_gather(
@@ -1089,6 +1145,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         prefix: str,
         config: DeepseekV2Config | None = None,
         topk_indices_buffer: torch.Tensor | None = None,
+        enable_sp: bool = False,
     ) -> None:
         super().__init__()
 
@@ -1141,16 +1198,33 @@ class DeepseekV2DecoderLayer(nn.Module):
             topk_indices_buffer=topk_indices_buffer,
         )
 
-        if (
-            config.n_routed_experts is not None
-            and layer_idx >= config.first_k_dense_replace
-            and layer_idx % moe_layer_freq == 0
-        ):
+        def _is_moe(idx: int) -> bool:
+            return (
+                config.n_routed_experts is not None
+                and idx >= config.first_k_dense_replace
+                and idx % moe_layer_freq == 0
+            )
+
+        # A dense DeepseekV2MLP is TP-sharded with a RowParallel all-reduce, so
+        # every rank has to see the same rows -- it cannot consume a per-rank
+        # chunk. Only MoE layers may therefore join the SP domain, which for
+        # GLM-5.2 means the domain starts at `first_k_dense_replace`.
+        sp_enabled = (
+            enable_sp
+            and _SP_LAYER_BOUNDARY
+            and get_tensor_model_parallel_world_size() > 1
+        )
+        self.sp_layer = sp_enabled and _is_moe(layer_idx)
+        # The previous layer left the residual chunked, so our input is chunked.
+        self.sp_input_chunked = sp_enabled and layer_idx > 0 and _is_moe(layer_idx - 1)
+
+        if _is_moe(layer_idx):
             self.mlp = DeepseekV2MoE(
                 config=config,
                 parallel_config=parallel_config,
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
+                sp_chunk_external=self.sp_layer,
             )
         else:
             self.mlp = DeepseekV2MLP(
@@ -1166,6 +1240,14 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
 
+    def sp_active(self, num_tokens: int) -> bool:
+        """Whether this layer hands a chunked residual to the next one."""
+        return self.sp_layer and num_tokens >= _SP_LAYER_MIN_TOKENS
+
+    def sp_input_active(self, num_tokens: int) -> bool:
+        """Whether this layer receives a chunked residual."""
+        return self.sp_input_chunked and num_tokens >= _SP_LAYER_MIN_TOKENS
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -1173,12 +1255,21 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: torch.Tensor | None,
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        num_tokens = positions.size(0)
+        sp_layer = self.sp_active(num_tokens)
+        sp_input = self.sp_input_active(num_tokens)
+
         # Self Attention
         if residual is None:
             residual = hidden_states.clone()
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
+        if sp_input:
+            # The residual stays chunked across the whole domain; only the
+            # attention input has to be materialized for every token.
+            hidden_states = _sp_gather(hidden_states, num_tokens)
 
         attn_kwargs = {
             "positions": positions,
@@ -1201,9 +1292,21 @@ class DeepseekV2DecoderLayer(nn.Module):
                 # first layer.
                 residual *= 1.0 / self.routed_scaling_factor
 
+        if sp_layer:
+            hidden_states = sequence_parallel_chunk(hidden_states)
+            if not sp_input:
+                # Entering the domain: bring the residual down to our chunk.
+                residual = sequence_parallel_chunk(residual)
+        elif sp_input:
+            # Leaving the domain (e.g. below the token threshold on this step).
+            residual = _sp_gather(residual, num_tokens)
+
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        if self.sp_layer:
+            hidden_states = self.mlp(hidden_states, sp_layer)
+        else:
+            hidden_states = self.mlp(hidden_states)
 
         if isinstance(self.mlp, DeepseekV2MLP) and hidden_states.dtype == torch.float16:
             # Fix FP16 overflow
@@ -1256,6 +1359,7 @@ class DeepseekV2Model(nn.Module):
                 vllm_config=vllm_config,
                 prefix=prefix,
                 topk_indices_buffer=topk_indices_buffer,
+                enable_sp=True,
             ),
             prefix=f"{prefix}.layers",
         )
@@ -1321,6 +1425,8 @@ class DeepseekV2Model(nn.Module):
             llama_4_scaling = None
 
         aux_hidden_states = []
+        num_tokens = positions.size(0)
+        sp_chunked_out = False
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
@@ -1330,6 +1436,13 @@ class DeepseekV2Model(nn.Module):
             hidden_states, residual = layer(
                 positions, hidden_states, residual, llama_4_scaling
             )
+            sp_chunked_out = layer.sp_active(num_tokens)
+
+        if sp_chunked_out:
+            # Close the SP domain: the final norm (and any downstream consumer)
+            # expects the full batch on every rank.
+            hidden_states = _sp_gather(hidden_states, num_tokens)
+            residual = _sp_gather(residual, num_tokens)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
