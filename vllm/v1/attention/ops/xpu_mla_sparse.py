@@ -272,3 +272,123 @@ def triton_bf16_mla_sparse_interface(
     )
 
     return out, max_logits, softmax_lse
+
+
+# fp8_ds_mla packed layout, per token (656 bytes, kv_lora_rank=512, pe_dim=64):
+#   bytes [0, 512)    : 512 float8_e4m3 NoPE values
+#   bytes [512, 528)  : 4 float32 scales, one per 128-element NoPE tile
+#   bytes [528, 656)  : 64 bfloat16 RoPE values (kept unquantized)
+# This mirrors `concat_and_cache_ds_mla_kernel` in
+# csrc/libtorch_stable/cache_kernels.cu, which is CUDA-only.
+DS_MLA_TILE_DIM = 128
+DS_MLA_ENTRY_BYTES = 656
+
+
+@triton.jit
+def _concat_and_cache_ds_mla_kernel(
+    kv_c_ptr,
+    k_pe_ptr,
+    cache_fp8_ptr,
+    cache_f32_ptr,
+    cache_bf16_ptr,
+    slot_mapping_ptr,
+    kv_c_stride,
+    k_pe_stride,
+    block_stride,
+    entry_stride,
+    KV_DIM: tl.constexpr,
+    PE_DIM: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    NUM_TILES: tl.constexpr,
+    TILE_DIM: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    slot_idx = tl.load(slot_mapping_ptr + token_idx)
+    # Padded tokens carry slot -1 and must not be written.
+    if slot_idx < 0:
+        return
+
+    block_idx = slot_idx // BLOCK_SIZE
+    block_off = slot_idx % BLOCK_SIZE
+    # Strides are byte offsets: the caller passes the uint8 view's strides.
+    byte_base = block_idx * block_stride + block_off * entry_stride
+
+    kv_off = tl.arange(0, KV_DIM)
+    kv_c = tl.load(kv_c_ptr + token_idx * kv_c_stride + kv_off).to(tl.float32)
+
+    kv_2d = tl.reshape(kv_c, (NUM_TILES, TILE_DIM))
+    tile_amax = tl.max(tl.abs(kv_2d), axis=1, keep_dims=True)
+    # scale = amax / 448 (fp8 e4m3 max), floored to FLT_MIN, matching the
+    # reference CUDA kernel.
+    tile_scale = tl.maximum(tile_amax * (1.0 / 448.0), 1.1754944e-38)
+
+    kv_fp8 = tl.reshape((kv_2d / tile_scale).to(tl.float8e4nv), (KV_DIM,))
+    tl.store(cache_fp8_ptr + byte_base + kv_off, kv_fp8)
+
+    tile_off = tl.arange(0, NUM_TILES)
+    tl.store(
+        cache_f32_ptr + byte_base // 4 + KV_DIM // 4 + tile_off,
+        tl.reshape(tile_scale, (NUM_TILES,)),
+    )
+
+    pe_off = tl.arange(0, PE_DIM)
+    k_pe = tl.load(k_pe_ptr + token_idx * k_pe_stride + pe_off)
+    tl.store(
+        cache_bf16_ptr + byte_base // 2 + (KV_DIM // 2 + 8) + pe_off,
+        k_pe.to(tl.bfloat16),
+    )
+
+
+def triton_concat_and_cache_ds_mla(
+    kv_c: torch.Tensor,  # [num_tokens, kv_lora_rank]
+    k_pe: torch.Tensor,  # [num_tokens, pe_dim]
+    kv_cache: torch.Tensor,  # [num_blocks, block_size, 656] uint8
+    slot_mapping: torch.Tensor,  # [num_tokens] int64
+) -> None:
+    """Pack latent KV into the 656-byte ``fp8_ds_mla`` cache layout.
+
+    Triton port of the CUDA-only ``concat_and_cache_ds_mla`` kernel, so that
+    non-CUDA platforms can use DeepSeek's segmented fp8 KV cache format.
+
+    Args:
+        kv_c: Normed latent KV, 16-bit.
+        k_pe: RoPE'd positional part, 16-bit.
+        kv_cache: uint8 paged cache with a 656-byte entry stride.
+        slot_mapping: Destination slot per token; negative entries are skipped.
+    """
+    kv_lora_rank = kv_c.shape[1]
+    pe_dim = k_pe.shape[1]
+    block_size = kv_cache.shape[1]
+    assert kv_lora_rank == 512, "fp8_ds_mla requires kv_lora_rank == 512"
+    assert pe_dim == 64, "fp8_ds_mla requires pe_dim == 64"
+    assert kv_c.element_size() == 2 and k_pe.element_size() == 2
+    assert kv_cache.dtype == torch.uint8
+    assert kv_cache.shape[2] == DS_MLA_ENTRY_BYTES
+
+    num_tokens = slot_mapping.shape[0]
+    if num_tokens == 0:
+        return
+
+    # The three views alias the same buffer; each store uses the element size
+    # matching the field it writes.
+    cache_fp8 = kv_cache.view(torch.float8_e4m3fn)
+    cache_f32 = kv_cache.view(torch.float32)
+    cache_bf16 = kv_cache.view(torch.bfloat16)
+
+    _concat_and_cache_ds_mla_kernel[(num_tokens,)](
+        kv_c,
+        k_pe,
+        cache_fp8,
+        cache_f32,
+        cache_bf16,
+        slot_mapping,
+        kv_c.stride(0),
+        k_pe.stride(0),
+        kv_cache.stride(0),
+        kv_cache.stride(1),
+        KV_DIM=kv_lora_rank,
+        PE_DIM=pe_dim,
+        BLOCK_SIZE=block_size,
+        NUM_TILES=kv_lora_rank // DS_MLA_TILE_DIM,
+        TILE_DIM=DS_MLA_TILE_DIM,
+    )
