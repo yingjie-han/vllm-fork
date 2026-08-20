@@ -249,3 +249,13 @@ vllm/grpc/vllm_engine_pb2.pyi
 
 # Ignore generated cpu headers 
 csrc/cpu/cpu_attn_dispatch_generated.h
+
+# Local experiment scratch (XPU B70 tree)
+xattention/
+patches/
+*.patch
+examples/basic/offline_inference/*_profile*/
+examples/basic/offline_inference/*_unitrace/
+examples/basic/offline_inference/*-log.txt
+# Stale generated marlin kernels from the pre-libtorch_stable path
+csrc/moe/marlin_moe_wna16/
