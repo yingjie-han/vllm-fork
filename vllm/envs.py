@@ -274,6 +274,19 @@ if TYPE_CHECKING:
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
     VLLM_NIC_SELECTION_VARS: str = ""
     VLLM_PREFIX_CACHE_RETENTION_INTERVAL: int | None = None
+    VLLM_DSV4_SP_LAYER: bool = False
+    VLLM_DSV4_SP_LAYER_MIN_TOKENS: int = 128
+    VLLM_DSV4_SP_MOE_RS: bool = True
+    VLLM_DSV4_SP_ATTN_RS: bool = True
+    VLLM_DSV4_DEEPSYMM: bool = False
+    VLLM_DSV4_DEEPSYMM_MIN_TOKENS: str | None = None
+    VLLM_DSV4_SP_SHARED_TP: bool = True
+    VLLM_DSV4_SP_SHARED_CHECK: bool = False
+    VLLM_DSV4_SP_DEBUG: bool = False
+    VLLM_GLM_SP_LAYER: bool = False
+    VLLM_GLM_SP_LAYER_MIN_TOKENS: int = 128
+    VLLM_GLM_SP_MOE_RS: bool = True
+    VLLM_GLM_DEEPSYMM: bool = False
 
 
 def get_default_cache_root():
@@ -1873,6 +1886,35 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Each entry is VAR_NAME or VAR_NAME:<suffix> (suffix appended to
     # RDMA device name). Must be set together with VLLM_GPU_NIC_PCIE_MAPPING.
     "VLLM_NIC_SELECTION_VARS": lambda: os.getenv("VLLM_NIC_SELECTION_VARS", ""),
+    # Eager sequence-parallel MoE switches for DeepSeek-V4 and GLM-5.2.
+    # These are read at import time by the model files, but they change the
+    # traced graph (whether `sequence_parallel_chunk` is emitted at all), so
+    # they must be registered here to reach `compile_factors()` -- otherwise
+    # arms with different settings silently share one AOT compile artifact.
+    "VLLM_DSV4_SP_LAYER": lambda: bool(int(os.getenv("VLLM_DSV4_SP_LAYER", "0"))),
+    "VLLM_DSV4_SP_LAYER_MIN_TOKENS": lambda: int(
+        os.getenv("VLLM_DSV4_SP_LAYER_MIN_TOKENS", "128")
+    ),
+    "VLLM_DSV4_SP_MOE_RS": lambda: bool(int(os.getenv("VLLM_DSV4_SP_MOE_RS", "1"))),
+    "VLLM_DSV4_SP_ATTN_RS": lambda: bool(int(os.getenv("VLLM_DSV4_SP_ATTN_RS", "1"))),
+    "VLLM_DSV4_DEEPSYMM": lambda: bool(int(os.getenv("VLLM_DSV4_DEEPSYMM", "0"))),
+    "VLLM_DSV4_DEEPSYMM_MIN_TOKENS": lambda: os.getenv(
+        "VLLM_DSV4_DEEPSYMM_MIN_TOKENS", None
+    ),
+    "VLLM_DSV4_SP_SHARED_TP": lambda: bool(
+        int(os.getenv("VLLM_DSV4_SP_SHARED_TP", "1"))
+    ),
+    "VLLM_DSV4_SP_SHARED_CHECK": lambda: bool(
+        int(os.getenv("VLLM_DSV4_SP_SHARED_CHECK", "0"))
+    ),
+    # Logging only -- see ignored_factors in compile_factors().
+    "VLLM_DSV4_SP_DEBUG": lambda: bool(int(os.getenv("VLLM_DSV4_SP_DEBUG", "0"))),
+    "VLLM_GLM_SP_LAYER": lambda: bool(int(os.getenv("VLLM_GLM_SP_LAYER", "0"))),
+    "VLLM_GLM_SP_LAYER_MIN_TOKENS": lambda: int(
+        os.getenv("VLLM_GLM_SP_LAYER_MIN_TOKENS", "128")
+    ),
+    "VLLM_GLM_SP_MOE_RS": lambda: bool(int(os.getenv("VLLM_GLM_SP_MOE_RS", "1"))),
+    "VLLM_GLM_DEEPSYMM": lambda: bool(int(os.getenv("VLLM_GLM_DEEPSYMM", "0"))),
 }
 
 
@@ -2020,6 +2062,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_ENABLE_CUDA_COMPATIBILITY",
         "VLLM_CUDA_COMPATIBILITY_PATH",
         "VLLM_SKIP_MODEL_NAME_VALIDATION",
+        "VLLM_DSV4_SP_DEBUG",
         "LOCAL_RANK",
         "CUDA_VISIBLE_DEVICES",
         "NO_COLOR",
