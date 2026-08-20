@@ -245,6 +245,33 @@ class DeepseekV2MLP(nn.Module):
         return x
 
 
+class DeepseekV2SPSharedExperts(nn.Module):
+    """Switch the shared expert between replicated and TP-sharded weight copies."""
+
+    def __init__(self, replicated: nn.Module, sharded: nn.Module) -> None:
+        super().__init__()
+        object.__setattr__(self, "_replicated", replicated)
+        object.__setattr__(self, "_sharded", sharded)
+        self.use_sharded = False
+
+    def forward(self, x):
+        out = self._sharded(x) if self.use_sharded else self._replicated(x)
+        if _SP_SHARED_CHECK and self.use_sharded:
+            from vllm.distributed import tensor_model_parallel_all_reduce
+
+            ref = self._replicated(x)
+            got = tensor_model_parallel_all_reduce(out.clone())
+            print(
+                "[dsv4-sp] shardcheck maxdiff=%.4e refmax=%.4e"
+                % (
+                    (got.float() - ref.float()).abs().max().item(),
+                    ref.float().abs().max().item(),
+                ),
+                flush=True,
+            )
+        return out
+
+
 # Opt-in (GLM-5.2 / XPU): run everything in the decoder layer except attention
 # on the local token chunk, so the norms and the residual stop being replicated
 # across TP ranks. The residual then stays chunked across layers and only the
@@ -263,6 +290,11 @@ _SP_MOE_REDUCE_SCATTER = os.environ.get("VLLM_GLM_SP_MOE_RS", "1") == "1"
 # the expert permute and the reduce-scatter into the unpermute, so the MoE
 # costs no standalone collective at all. Requires the SP domain to be on.
 _SP_MOE_DEEPSYMM = os.environ.get("VLLM_GLM_DEEPSYMM", "0") == "1"
+
+# Shared-expert TP split for eager-SP paths: keep one replicated copy for the
+# local chunked DeepSymm path and one TP-sharded copy for the full-batch path.
+_SP_SHARED_TP = os.environ.get("VLLM_DSV4_SP_SHARED_TP", "1") == "1"
+_SP_SHARED_CHECK = os.environ.get("VLLM_DSV4_SP_SHARED_CHECK", "0") == "1"
 
 
 def _sp_gather(x: torch.Tensor, num_tokens: int) -> torch.Tensor:
@@ -346,6 +378,8 @@ class DeepseekV2MoE(nn.Module):
             # Accumulates in fp32; avoids bf16->fp32 cast.
             self.gate.set_out_dtype(self.gate.weight.dtype)
 
+        self.shared_experts_tp = None
+        self._shared_experts_module = None
         if config.n_shared_experts is None or self.is_fusion_moe_shared_experts_enabled:
             self.shared_experts = None
         else:
@@ -360,9 +394,23 @@ class DeepseekV2MoE(nn.Module):
                 reduce_results=False,
                 prefix=f"{prefix}.shared_experts",
             )
+            self._shared_experts_module = self.shared_experts
+            if self.enable_eager_sp and _SP_SHARED_TP and self.tp_size > 1:
+                self.shared_experts_tp = DeepseekV2MLP(
+                    hidden_size=config.hidden_size,
+                    intermediate_size=intermediate_size,
+                    hidden_act=config.hidden_act,
+                    quant_config=quant_config,
+                    reduce_results=False,
+                    is_sequence_parallel=False,
+                    prefix=f"{prefix}.shared_experts_tp",
+                )
+                self._shared_experts_module = DeepseekV2SPSharedExperts(
+                    self.shared_experts, self.shared_experts_tp
+                )
 
         self.experts = FusedMoE(
-            shared_experts=self.shared_experts,
+            shared_experts=self._shared_experts_module,
             gate=self.gate,
             num_experts=config.n_routed_experts,
             top_k=config.num_experts_per_tok,
@@ -396,6 +444,39 @@ class DeepseekV2MoE(nn.Module):
             self.gate.e_score_correction_bias.data = (
                 self.gate.e_score_correction_bias.data.to(self.gate.out_dtype)
             )
+
+    def post_load_weights(self) -> None:
+        """Derive the TP-sharded shared-expert copy from the replicated one."""
+        if self.shared_experts_tp is None or self.shared_experts is None:
+            return
+
+        tp_rank = get_tensor_model_parallel_rank()
+        if _SP_SHARED_CHECK:
+            # Debug only: overwrites the loaded shared-expert weights so the
+            # replicated-vs-sharded comparison runs on non-degenerate inputs.
+            for mod in (self.shared_experts.gate_up_proj, self.shared_experts.down_proj):
+                w = mod.weight
+                w.data.copy_(torch.randn(w.shape, device=w.device).to(w.dtype))
+                sc = getattr(mod, "weight_scale_inv", None)
+                if sc is not None:
+                    sc.data.copy_(torch.ones_like(sc.data.float()).to(sc.dtype))
+
+        def copy_shard(src_mod, dst_mod, dim: int, halves: int) -> None:
+            for name in ("weight", "weight_scale_inv", "weight_scale"):
+                src = getattr(src_mod, name, None)
+                dst = getattr(dst_mod, name, None)
+                if src is None or dst is None:
+                    continue
+                shard = dst.shape[dim] // halves
+                stride = src.shape[dim] // halves
+                for h in range(halves):
+                    dst.data.narrow(dim, h * shard, shard).copy_(
+                        src.data.narrow(dim, h * stride + tp_rank * shard, shard)
+                    )
+
+        tp = self.shared_experts_tp
+        copy_shard(self.shared_experts.gate_up_proj, tp.gate_up_proj, 0, 2)
+        copy_shard(self.shared_experts.down_proj, tp.down_proj, 1, 1)
 
     def forward(
         self,

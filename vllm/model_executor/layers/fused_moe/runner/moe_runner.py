@@ -964,15 +964,24 @@ class MoERunner(MoERunnerInterface):
             shared_layer.use_sharded = sharded_shared
 
         if _SP_DEBUG and self._eager_sp:
-            key = (hidden_states.shape[0], use_deepsymm, eager_sp_global)
+            key = (
+                hidden_states.shape[0],
+                use_deepsymm,
+                eager_sp_global,
+                sharded_shared,
+            )
             if key not in _sp_debug_seen:
                 _sp_debug_seen.add(key)
                 logger.info(
-                    "[dsv4-sp] tokens=%d threshold=%d deepsymm=%s sp_chunked=%s",
+                    "[dsv4-sp] tokens=%d threshold=%d deepsymm=%s sp_chunked=%s "
+                    "sharded_shared=%s shared_layer=%s same_input=%s",
                     hidden_states.shape[0],
                     self._eager_sp_fusion_threshold,
                     use_deepsymm,
                     self.sp_external_chunked,
+                    sharded_shared,
+                    type(shared_layer).__name__,
+                    shared_experts_input is hidden_states,
                 )
         self._sp_local_last_call = use_deepsymm
         self._sp_shared_already_reduced = self._eager_sp
