@@ -170,11 +170,26 @@ class XPUExperts(mk.FusedMoEExpertsModular):
                 num_experts=self.moe_config.num_local_experts,
                 ep_rank=self.moe_config.ep_rank,
                 ep_size=self.moe_config.ep_size,
-                is_fp8=self.is_fp8,
-                is_int4=self.is_int4,
-                is_mxfp4=self.is_mxfp4,
-                is_mxfp8=self.is_mxfp8,
-                is_block_fp8=self.is_block_fp8,
+            )
+            # The kernel now infers the quant type from the weights instead of
+            # taking is_* flags; a mismatch would silently pick a wrong path.
+            detected = {
+                "fp8": self.fused_moe_impl.is_fp8,
+                "int4": self.fused_moe_impl.is_int4,
+                "mxfp4": self.fused_moe_impl.is_mxfp4,
+                "mxfp8": self.fused_moe_impl.is_mxfp8,
+                "block_fp8": self.fused_moe_impl.is_block_fp8,
+            }
+            expected = {
+                "fp8": self.is_fp8,
+                "int4": self.is_int4,
+                "mxfp4": self.is_mxfp4,
+                "mxfp8": self.is_mxfp8,
+                "block_fp8": self.is_block_fp8,
+            }
+            assert detected == expected, (
+                f"XpuFusedMoe quant-type mismatch: kernel detected {detected}, "
+                f"vLLM expected {expected}"
             )
         assert self.fused_moe_impl is not None
         self.fused_moe_impl.apply(
