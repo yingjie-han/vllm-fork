@@ -54,9 +54,7 @@ logger = init_logger(__name__)
 _SPARSE_MLA_TOPK_BLOCK_SIZE = 16
 _EFFECTIVE_TOPK_MODE = os.getenv("VLLM_XPU_MLA_EFFECTIVE_TOPK", "auto")
 if _EFFECTIVE_TOPK_MODE not in {"0", "1", "auto"}:
-    raise ValueError(
-        "VLLM_XPU_MLA_EFFECTIVE_TOPK must be one of: 0, 1, auto"
-    )
+    raise ValueError("VLLM_XPU_MLA_EFFECTIVE_TOPK must be one of: 0, 1, auto")
 
 
 def _get_effective_topk_width(max_seq_len: int, topk_tokens: int) -> int:
@@ -128,6 +126,7 @@ class XPUMLASparseMetadata(AttentionMetadata):
 
     block_table: torch.Tensor
     req_id_per_token: torch.Tensor
+    seq_lens: torch.Tensor | None = None
 
     block_size: int = 1
     topk_tokens: int = 2048
@@ -140,7 +139,10 @@ class XPUMLASparseMetadata(AttentionMetadata):
 
 @dataclass
 class XPUMLASparseMetadataBuilder(AttentionMetadataBuilder[XPUMLASparseMetadata]):
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.NEVER
+    # Every tensor the kernels read is either shape-derived or held in a
+    # persistent buffer, and the forward has no host syncs or data-dependent
+    # branches, so uniform-query-length batches are graph-capturable.
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
 
     def __init__(
         self,
@@ -149,11 +151,11 @@ class XPUMLASparseMetadataBuilder(AttentionMetadataBuilder[XPUMLASparseMetadata]
         vllm_config: VllmConfig,
         device: torch.device,
     ):
-        self.kv_cache_spec = kv_cache_spec
+        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self.model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
-        self.device = device
         max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
 
         self.num_heads = self.model_config.get_num_attention_heads(parallel_config)
         self.mla_dims = get_mla_dims(self.model_config)
@@ -182,9 +184,6 @@ class XPUMLASparseMetadataBuilder(AttentionMetadataBuilder[XPUMLASparseMetadata]
         fast_build: bool = False,
     ) -> XPUMLASparseMetadata:
         num_tokens = common_attn_metadata.num_actual_tokens
-        num_decodes, num_prefills, num_decode_tokens, _ = (
-            split_decodes_and_prefills(common_attn_metadata)
-        )
         starts = np.asarray(common_attn_metadata.query_start_loc_cpu, dtype=np.int32)
         seg_lengths = np.diff(starts)
         req_id_per_token = np.repeat(
@@ -198,6 +197,11 @@ class XPUMLASparseMetadataBuilder(AttentionMetadataBuilder[XPUMLASparseMetadata]
 
         req_id_per_token = self.req_id_per_token_buffer[:num_tokens]
 
+        num_decodes, num_prefills, num_decode_tokens, _ = split_decodes_and_prefills(
+            common_attn_metadata,
+            decode_threshold=self.reorder_batch_threshold or 1,
+        )
+
         metadata = XPUMLASparseMetadata(
             num_reqs=common_attn_metadata.num_reqs,
             max_query_len=common_attn_metadata.max_query_len,
@@ -207,6 +211,7 @@ class XPUMLASparseMetadataBuilder(AttentionMetadataBuilder[XPUMLASparseMetadata]
             slot_mapping=common_attn_metadata.slot_mapping,
             block_table=common_attn_metadata.block_table_tensor,
             req_id_per_token=req_id_per_token,
+            seq_lens=common_attn_metadata.seq_lens,
             block_size=self.kv_cache_spec.block_size,
             topk_tokens=self.topk_tokens,
             num_decodes=num_decodes,
@@ -346,19 +351,15 @@ class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata]):
             effective_topk = _get_effective_topk_width(
                 attn_metadata.max_seq_len, attn_metadata.topk_tokens
             )
-        topk_indices = self.topk_indices_buffer[
-            :num_actual_toks, :effective_topk
-        ]
+        topk_indices = self.topk_indices_buffer[:num_actual_toks, :effective_topk]
 
-        topk_indices_global, topk_length = (
-            triton_convert_req_index_to_global_index(
-                attn_metadata.req_id_per_token,
-                attn_metadata.block_table,
-                topk_indices,
-                BLOCK_SIZE=attn_metadata.block_size,
-                NUM_TOPK_TOKENS=effective_topk,
-                return_valid_counts=True,
-            )
+        topk_indices_global, topk_length = triton_convert_req_index_to_global_index(
+            attn_metadata.req_id_per_token,
+            attn_metadata.block_table,
+            topk_indices,
+            BLOCK_SIZE=attn_metadata.block_size,
+            NUM_TOPK_TOKENS=effective_topk,
+            return_valid_counts=True,
         )
 
         if is_quantized_kv_cache(self.kv_cache_dtype):
