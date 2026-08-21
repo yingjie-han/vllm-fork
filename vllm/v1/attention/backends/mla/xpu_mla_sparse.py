@@ -71,6 +71,7 @@ class XPUMLASparseBackend(AttentionBackend):
         "float16",
         "bfloat16",
         "fp8_ds_mla",
+        "fp8",  # alias for fp8_ds_mla
     ]
 
     @staticmethod
