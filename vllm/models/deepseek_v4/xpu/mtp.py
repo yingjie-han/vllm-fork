@@ -48,6 +48,7 @@ from vllm.sequence import IntermediateTensors
 
 from .model import (
     DeepseekV4DecoderLayer,
+    _sequence_parallel_gather_nd,
     make_deepseek_v4_expert_params_mapping,
 )
 
@@ -164,6 +165,10 @@ class DeepSeekV4MultiTokenPredictorLayer(nn.Module):
         hidden_states = self.mtp_block.hc_post(
             hidden_states, residual, post_mix, res_mix
         )
+        if self.mtp_block.sp_active(positions.size(0)):
+            hidden_states = _sequence_parallel_gather_nd(
+                hidden_states, positions.size(0)
+            )
         # Return the flat pre-hc_head residual so it can be re-fed as the
         # next spec step's `previous_hidden_states` when
         # num_speculative_tokens > 1. hc_head is deferred to compute_logits.
