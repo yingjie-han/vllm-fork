@@ -1699,6 +1699,10 @@ class DeepseekV2Model(nn.Module):
             if (
                 hidden_states.shape[0] != positions.shape[0]
                 and not layer.use_sequence_parallel_moe
+                # The eager-SP domain deliberately keeps both tensors chunked
+                # across layer boundaries; undoing that here would leave the
+                # residual full-length while the layer re-chunks hidden_states.
+                and not layer.sp_input_active(num_tokens)
             ):
                 combined_states = torch.cat([hidden_states, residual], dim=-1)
                 combined_states = tensor_model_parallel_all_gather(combined_states, 0)
