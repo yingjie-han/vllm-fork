@@ -1193,6 +1193,32 @@ class RoutedExperts(PluggableLayer):
     # Execution
     #
 
+    def forward_sp(
+        self,
+        sp_moe_kernel,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Execute routed experts via the DeepSymm SP MoE kernel.
+
+        Used when sequence parallelism is active and the MoE runner
+        receives a local TP chunk. The SP kernel handles fused
+        allgather_remap in prepare and unpermute_reducescatter in finalize.
+        """
+        return sp_moe_kernel.apply(
+            hidden_states=x,
+            w1=self.w13_weight,
+            w2=self.w2_weight,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            activation=self.activation,
+            global_num_experts=self.global_num_experts,
+            expert_map=self.expert_map,
+            apply_router_weight_on_input=self.apply_router_weight_on_input,
+        )
+
     def forward_modular(
         self,
         x: torch.Tensor,

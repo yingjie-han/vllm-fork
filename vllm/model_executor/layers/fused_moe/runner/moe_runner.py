@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Callable, Iterable
 from contextlib import nullcontext
 from typing import TYPE_CHECKING
@@ -13,6 +14,7 @@ from vllm.distributed import (
     get_ep_group,
     get_pcp_group,
     tensor_model_parallel_all_reduce,
+    tensor_model_parallel_reduce_scatter,
 )
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.forward_context import (
@@ -52,6 +54,11 @@ from vllm.utils.torch_utils import (
 )
 
 logger = init_logger(__name__)
+
+# Debug aid for the eager-SP threshold: logs each distinct (local tokens, branch)
+# pair once so a run can be checked against the intended path.
+_SP_DEBUG = os.environ.get("VLLM_DSV4_SP_DEBUG", "0") == "1"
+_sp_debug_seen: set[tuple[int, bool, bool, bool]] = set()
 
 
 def register_layer_for_moe_forward_op(
@@ -238,6 +245,15 @@ class MoERunner(MoERunnerInterface):
     for different configurations (e.g., with/without shared experts, gates, etc.).
     """
 
+    # Set per-forward by callers that feed us an all-gathered chunk (DSv4
+    # layer-wide SP): turns the final all-reduce into a reduce-scatter so the
+    # caller gets its own chunk back without moving the full batch twice.
+    sp_external_reduce_scatter = False
+
+    # Set per-forward by DSv4: False means the layer stayed outside the SP
+    # domain this step and handed us the full batch instead of a local chunk.
+    sp_external_chunked = True
+
     def __init__(
         self,
         layer_name: str,
@@ -245,6 +261,7 @@ class MoERunner(MoERunnerInterface):
         router: FusedMoERouter,
         routed_experts: RoutedExperts,
         enable_dbo: bool = False,
+        enable_eager_sp: bool = False,
         gate: torch.nn.Module | None = None,
         shared_experts: torch.nn.Module | None = None,
         shared_expert_gate: torch.nn.Module | None = None,
@@ -288,6 +305,76 @@ class MoERunner(MoERunnerInterface):
 
         # For smuggling this layer into the fused moe custom op
         register_layer_for_moe_forward_op(get_current_vllm_config(), self)
+
+        # When True, the model passes a local TP chunk directly and expects
+        # the runner to handle all_gather/reduce_scatter internally via the
+        # DeepSymm SP kernel (when above fusion threshold).
+        self._eager_sp = enable_eager_sp
+        self._eager_sp_fusion_threshold = (
+            get_current_vllm_config().parallel_config.eager_sp_threshold
+            if enable_eager_sp
+            else 0
+        )
+        self._sp_local_last_call = False
+        self._sp_shared_already_reduced = False
+        self._sp_deferred_reduce: str | None = None
+        # Created lazily on the first SP forward, which is the KV-cache
+        # profiling run, so the SymmBuffer is accounted for there.
+        self._sp_moe_kernel: "FusedMoEKernel | None" = None
+        tp_size = get_current_vllm_config().parallel_config.tensor_parallel_size
+        max_tokens = get_current_vllm_config().scheduler_config.max_num_batched_tokens
+        self._sp_max_tokens_per_rank = (max_tokens + tp_size - 1) // tp_size
+
+    def _create_sp_moe_kernel(self):
+        from vllm.distributed import get_tp_group
+        from vllm.distributed.device_communicators.all2all import (
+            DeepSymmAll2AllManager,
+        )
+        from vllm.model_executor.layers.fused_moe.config import (
+            FusedMoEQuantConfig,
+        )
+        from vllm.model_executor.layers.fused_moe.experts.xpu_grouped_gemm_moe import (  # noqa: E501
+            XPUGroupedGemmExperts,
+        )
+        from vllm.model_executor.layers.fused_moe.modular_kernel import (
+            FusedMoEKernel,
+        )
+        from vllm.model_executor.layers.fused_moe.prepare_finalize.deepsymm_sp import (  # noqa: E501
+            XPUDeepSymmPrepareFinalize,
+        )
+
+        tp_group = get_tp_group()
+        all2all_manager = DeepSymmAll2AllManager(
+            cpu_group=tp_group.cpu_group,
+            tp_group=tp_group.device_group,
+            max_tokens_per_rank=self._sp_max_tokens_per_rank,
+        )
+
+        prepare_finalize = XPUDeepSymmPrepareFinalize(
+            all2all_manager=all2all_manager,
+        )
+
+        # Reuse the standard kernel's quant config when it exists so the
+        # grouped GEMM sees the same int4/mxfp4 layout as the non-SP path.
+        moe_kernel = getattr(self._quant_method, "moe_kernel", None)
+        if moe_kernel is not None:
+            existing_experts = moe_kernel.fused_experts
+            quant_config = existing_experts.quant_config
+            is_int4 = getattr(existing_experts, "is_int4", False)
+            is_mxfp4 = getattr(existing_experts, "is_mxfp4", False)
+        else:
+            quant_config = FusedMoEQuantConfig.make()
+            is_int4 = False
+            is_mxfp4 = False
+
+        experts = XPUGroupedGemmExperts(
+            moe_config=self.moe_config,
+            quant_config=quant_config,
+        )
+        experts.is_int4 = is_int4
+        experts.is_mxfp4 = is_mxfp4
+
+        return FusedMoEKernel(prepare_finalize, experts)
 
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]]
@@ -407,6 +494,20 @@ class MoERunner(MoERunnerInterface):
             and self._quant_method.moe_kernel.output_is_reduced()
         )
 
+    @property
+    def sp_external_reduce_scatter_ok(self) -> bool:
+        """Whether a caller feeding us an all-gathered chunk may ask for the
+        final all-reduce to be turned into a reduce-scatter.
+
+        Only valid on the "late" reduce path, where the combined
+        shared+fused sum is still a partial sum owned by this rank.
+        """
+        return (
+            not self.moe_config.is_sequence_parallel
+            and self.moe_config.tp_size > 1
+            and not self._fused_output_is_reduced
+        )
+
     def _maybe_reduce_shared_expert_output(
         self,
         shared_output: torch.Tensor | None,
@@ -426,7 +527,8 @@ class MoERunner(MoERunnerInterface):
         if (
             shared_output is not None
             and not self.moe_config.is_sequence_parallel
-            and fused_output_is_reduced
+            and not self._sp_shared_already_reduced
+            and (fused_output_is_reduced or self._sp_local_last_call)
         ):
             shared_output = tensor_model_parallel_all_reduce(shared_output)
         return shared_output
@@ -478,13 +580,26 @@ class MoERunner(MoERunnerInterface):
         if output_is_reduced is None:
             output_is_reduced = self._fused_output_is_reduced
 
-        if (
+        if self._sp_deferred_reduce is not None:
+            # Eager SP with a TP-sharded shared expert: routed and shared are
+            # partial sums over the same rows, so they ride one collective.
+            mode = self._sp_deferred_reduce
+            self._sp_deferred_reduce = None
+            if mode == "rs":
+                states = tensor_model_parallel_reduce_scatter(states, 0)
+            else:
+                states = tensor_model_parallel_all_reduce(states)
+        elif (
             not self.moe_config.is_sequence_parallel
             and not self.moe_config.skip_final_all_reduce
+            and not self._sp_local_last_call
             and (self.moe_config.tp_size > 1 or self.moe_config.ep_size > 1)
             and not output_is_reduced
         ):
-            states = tensor_model_parallel_all_reduce(states)
+            if self.sp_external_reduce_scatter:
+                states = tensor_model_parallel_reduce_scatter(states, 0)
+            else:
+                states = tensor_model_parallel_all_reduce(states)
 
         return states[..., :trunc_size] if trunc_size is not None else states
 
@@ -600,13 +715,23 @@ class MoERunner(MoERunnerInterface):
                 input_ids=input_ids,
             )
 
-            fused_out = self.routed_experts.forward_modular(
-                x=hidden_states,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                shared_experts=self._shared_experts,
-                shared_experts_input=shared_experts_input,
-            )
+            if self._sp_local_last_call:
+                if self._sp_moe_kernel is None:
+                    self._sp_moe_kernel = self._create_sp_moe_kernel()
+                fused_out = self.routed_experts.forward_sp(
+                    self._sp_moe_kernel,
+                    x=hidden_states,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                )
+            else:
+                fused_out = self.routed_experts.forward_modular(
+                    x=hidden_states,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    shared_experts=self._shared_experts,
+                    shared_experts_input=shared_experts_input,
+                )
 
         self._maybe_apply_shared_experts(
             shared_experts_input,
@@ -862,6 +987,71 @@ class MoERunner(MoERunnerInterface):
             else:
                 router_logits, _ = self.gate(hidden_states)
 
+        # Under eager SP the model hands us a local TP chunk. Above the fusion
+        # threshold the DeepSymm kernel does the all_gather/reduce_scatter
+        # itself; below it we expand here and reduce_scatter the routed output
+        # back. Shared experts have replicated weights either way, so their
+        # local-chunk output is already complete.
+        # When the layer skipped the SP domain this step it gives us the full
+        # batch, so there is nothing to expand -- all-reducing the routed output
+        # is enough, and all_gathering would replicate it tp_size times.
+        eager_sp_chunk = self._eager_sp and self.sp_external_chunked
+        eager_sp_global = self._eager_sp and not self.sp_external_chunked
+        use_deepsymm = eager_sp_chunk and (
+            hidden_states.shape[0] >= self._eager_sp_fusion_threshold
+        )
+        below_threshold_eager_sp = eager_sp_chunk and not use_deepsymm
+
+        # Outside the DeepSymm path every rank ends up holding the same full
+        # batch, so the shared expert can use its TP-sharded copy and let its
+        # partial sum ride along in the collective we already pay for.
+        shared_layer = getattr(self._shared_experts, "_layer", None)
+        sharded_shared = (
+            self._eager_sp
+            and not use_deepsymm
+            and self.moe_config.tp_size > 1
+            and hasattr(shared_layer, "use_sharded")
+            and (eager_sp_global or shared_experts_input is hidden_states)
+        )
+        if shared_layer is not None and hasattr(shared_layer, "use_sharded"):
+            shared_layer.use_sharded = sharded_shared
+
+        if _SP_DEBUG and self._eager_sp:
+            key = (
+                hidden_states.shape[0],
+                use_deepsymm,
+                eager_sp_global,
+                sharded_shared,
+            )
+            if key not in _sp_debug_seen:
+                _sp_debug_seen.add(key)
+                logger.info(
+                    "[dsv4-sp] tokens=%d threshold=%d deepsymm=%s sp_chunked=%s "
+                    "sharded_shared=%s shared_layer=%s same_input=%s",
+                    hidden_states.shape[0],
+                    self._eager_sp_fusion_threshold,
+                    use_deepsymm,
+                    self.sp_external_chunked,
+                    sharded_shared,
+                    type(shared_layer).__name__,
+                    shared_experts_input is hidden_states,
+                )
+        self._sp_local_last_call = use_deepsymm
+        self._sp_shared_already_reduced = self._eager_sp
+
+        if below_threshold_eager_sp:
+            from vllm.distributed import get_tp_group
+
+            hidden_states = get_tp_group().all_gather(hidden_states, dim=0)
+            router_logits = get_tp_group().all_gather(router_logits, dim=0)
+            if input_ids is not None:
+                # Hash-routed MoE selects experts from token ids; keep them in
+                # sync with the all-gathered activations.
+                input_ids = get_tp_group().all_gather(input_ids, dim=0)
+            if sharded_shared:
+                # Same tensor pre-gather, so this costs no extra collective.
+                shared_experts_input = hidden_states
+
         with self._sequence_parallel_context():
             # TODO(bnell): parts of the dispatch/combine steps will go away once
             # #32567 lands and the remaining kernels are made MKs.  The PCP
@@ -878,10 +1068,36 @@ class MoERunner(MoERunnerInterface):
                 input_ids=input_ids,
             )
 
-            return self._maybe_combine(
+            result = self._maybe_combine(
                 shared_output,
                 hidden_states,
             )
+
+        if below_threshold_eager_sp:
+            from vllm.distributed import get_tp_group
+
+            self._sp_local_last_call = True
+            if sharded_shared:
+                # Deferred so the shared partial sum can join this collective.
+                self._sp_deferred_reduce = "rs"
+            elif isinstance(result, tuple):
+                shared_out, fused_out = result
+                fused_out = get_tp_group().reduce_scatter(fused_out, dim=0)
+                result = (shared_out, fused_out)
+            else:
+                result = get_tp_group().reduce_scatter(result, dim=0)
+        elif eager_sp_global and self.moe_config.tp_size > 1:
+            # is_sequence_parallel suppresses the runner's own reduction paths,
+            # so the routed partial sums must be all-reduced here.
+            if sharded_shared:
+                self._sp_deferred_reduce = "ar"
+            elif isinstance(result, tuple):
+                shared_out, fused_out = result
+                result = (shared_out, tensor_model_parallel_all_reduce(fused_out))
+            else:
+                result = tensor_model_parallel_all_reduce(result)
+
+        return result
 
     #########################################################
     #
