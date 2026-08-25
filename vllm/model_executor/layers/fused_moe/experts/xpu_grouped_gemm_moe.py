@@ -212,6 +212,10 @@ class XPUGroupedGemmExperts(mk.FusedMoEExpertsModular):
             # The kernel infers int4/mxfp4 from the weight dtype rather than
             # from a flag, so a mislabelled dtype silently computes garbage.
             expected = torch.int8 if self.is_int4 else torch.float4_e2m1fn_x2
+            if w1.dtype == torch.uint8:
+                # mxfp4 checkpoints are stored as uint8, as in XPUExperts.
+                w1 = w1.view(expected)
+                w2 = w2.view(expected)
             assert w1.dtype == expected and w2.dtype == expected, (
                 f"XPUGroupedGemmExperts: is_int4={self.is_int4} "
                 f"is_mxfp4={self.is_mxfp4} needs {expected} weights, got "

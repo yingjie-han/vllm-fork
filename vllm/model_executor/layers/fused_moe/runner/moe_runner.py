@@ -98,6 +98,8 @@ def get_layer_from_name(layer_name: str) -> MoERunnerInterface:
 if TYPE_CHECKING:
     from typing import TypeAlias
 
+    from vllm.model_executor.layers.fused_moe.modular_kernel import FusedMoEKernel
+
     _layer_name_type: TypeAlias = str | LayerName
 else:
     _layer_name_type = LayerName if _USE_LAYERNAME else str
@@ -320,7 +322,7 @@ class MoERunner(MoERunnerInterface):
         self._sp_deferred_reduce: str | None = None
         # Created lazily on the first SP forward, which is the KV-cache
         # profiling run, so the SymmBuffer is accounted for there.
-        self._sp_moe_kernel: "FusedMoEKernel | None" = None
+        self._sp_moe_kernel: FusedMoEKernel | None = None
         tp_size = get_current_vllm_config().parallel_config.tensor_parallel_size
         max_tokens = get_current_vllm_config().scheduler_config.max_num_batched_tokens
         self._sp_max_tokens_per_rank = (max_tokens + tp_size - 1) // tp_size
@@ -358,21 +360,19 @@ class MoERunner(MoERunnerInterface):
         # grouped GEMM sees the same int4/mxfp4 layout as the non-SP path.
         moe_kernel = getattr(self._quant_method, "moe_kernel", None)
         if moe_kernel is not None:
-            existing_experts = moe_kernel.fused_experts
-            quant_config = existing_experts.quant_config
-            is_int4 = getattr(existing_experts, "is_int4", False)
-            is_mxfp4 = getattr(existing_experts, "is_mxfp4", False)
+            quant_config = moe_kernel.fused_experts.quant_config
         else:
             quant_config = FusedMoEQuantConfig.make()
-            is_int4 = False
-            is_mxfp4 = False
 
         experts = XPUGroupedGemmExperts(
             moe_config=self.moe_config,
             quant_config=quant_config,
         )
-        experts.is_int4 = is_int4
-        experts.is_mxfp4 = is_mxfp4
+        # XPUExperts derives the packed layout from the quant config rather
+        # than carrying is_int4/is_mxfp4 attributes, so mirror that here.
+        weight_dtype = quant_config.weight_quant_dtype
+        experts.is_int4 = weight_dtype == "int4"
+        experts.is_mxfp4 = weight_dtype == "mxfp4"
 
         return FusedMoEKernel(prepare_finalize, experts)
 
