@@ -44,6 +44,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
     tensor_model_parallel_reduce_scatter,
 )
 from vllm.logger import init_logger
@@ -316,6 +317,11 @@ _SP_LAYER_MIN_TOKENS = int(os.environ.get("VLLM_GLM_SP_LAYER_MIN_TOKENS", "128")
 # Inside the SP domain the MoE output only needs to come back as the local
 # chunk, so the runner's final all-reduce can become a reduce-scatter.
 _SP_MOE_REDUCE_SCATTER = os.environ.get("VLLM_GLM_SP_MOE_RS", "1") == "1"
+
+# Attention still runs on every token, but its output only has to come back as
+# the local chunk, so `o_proj`'s all-reduce can become a reduce-scatter and the
+# standalone chunk that followed it disappears.
+_SP_ATTN_REDUCE_SCATTER = os.environ.get("VLLM_GLM_SP_ATTN_RS", "1") == "1"
 
 # Hand the local chunk straight to DeepSymm, which folds the all-gather into
 # the expert permute and the reduce-scatter into the unpermute, so the MoE
@@ -1113,6 +1119,12 @@ class DeepseekV2MLAAttention(nn.Module):
         vllm/v1/attention/backends/mla/utils.py
     """
 
+    # Set by the layer-wide SP path (`VLLM_GLM_SP_LAYER`): `o_proj` then keeps
+    # its partial sum and this module performs the reduction itself, so a batch
+    # inside the SP domain can reduce-scatter straight into the local chunk.
+    sp_external_reduce = False
+    sp_reduce_scatter_out = False
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -1343,7 +1355,22 @@ class DeepseekV2MLAAttention(nn.Module):
         hidden_states: torch.Tensor,
         llama_4_scaling: torch.Tensor | None,
     ) -> torch.Tensor:
-        return self.mla_attn(positions, hidden_states, llama_4_scaling)
+        out = self.mla_attn(positions, hidden_states, llama_4_scaling)
+        if self.sp_external_reduce:
+            out = self._reduce_o_proj(out)
+        return out
+
+    def _reduce_o_proj(self, out: torch.Tensor) -> torch.Tensor:
+        """Reduce the `o_proj` partial sum that `reduce_results=False` left us."""
+        if not self.sp_reduce_scatter_out:
+            return tensor_model_parallel_all_reduce(out)
+        tp_size = get_tensor_model_parallel_world_size()
+        # Pad unconditionally: a data-dependent `if remainder` would be baked
+        # into the compiled graph and then break on a differently sized batch.
+        # small trick using minus, eg. -17 % 8 = 7
+        sp_pad = (-out.shape[0]) % tp_size
+        out = torch.nn.functional.pad(out, (0, 0, 0, sp_pad))
+        return tensor_model_parallel_reduce_scatter(out, 0)
 
 
 class DeepseekV2DecoderLayer(nn.Module):
@@ -1440,6 +1467,18 @@ class DeepseekV2DecoderLayer(nn.Module):
         # The previous layer left the residual chunked, so our input is chunked.
         self.sp_input_chunked = sp_enabled and layer_idx > 0 and _is_moe(layer_idx - 1)
 
+        # Let attention reduce straight into the local chunk instead of
+        # all-reducing every token and chunking afterwards.
+        self.sp_attn_rs = (
+            self.sp_layer
+            and _SP_ATTN_REDUCE_SCATTER
+            and not self.use_sequence_parallel_moe
+            and isinstance(self.self_attn, DeepseekV2MLAAttention)
+        )
+        if self.sp_attn_rs:
+            self.self_attn.o_proj.reduce_results = False
+            self.self_attn.sp_external_reduce = True
+
         if is_moe_layer:
             self.mlp = DeepseekV2MoE(
                 config=config,
@@ -1511,6 +1550,9 @@ class DeepseekV2DecoderLayer(nn.Module):
         }
         if not self.use_mha:
             attn_kwargs["llama_4_scaling"] = llama_4_scaling
+        if self.sp_attn_rs:
+            # Only a batch that stays inside the SP domain may take the chunk.
+            self.self_attn.sp_reduce_scatter_out = sp_layer
         hidden_states = self.self_attn(**attn_kwargs)
 
         if (
@@ -1536,7 +1578,8 @@ class DeepseekV2DecoderLayer(nn.Module):
             if not input_is_sequence_parallel:
                 residual = sequence_parallel_chunk(residual)
         elif sp_layer:
-            hidden_states = sequence_parallel_chunk(hidden_states)
+            if not self.sp_attn_rs:
+                hidden_states = sequence_parallel_chunk(hidden_states)
             if not sp_input:
                 # Entering the domain: bring the residual down to our chunk.
                 residual = sequence_parallel_chunk(residual)
@@ -1620,10 +1663,11 @@ class DeepseekV2Model(nn.Module):
             ]
             logger.info(
                 "GLM SP domain: layers %s of %d chunked "
-                "(min_tokens=%d, moe_rs=%s, deepsymm=%s)",
+                "(min_tokens=%d, attn_rs=%s, moe_rs=%s, deepsymm=%s)",
                 sp_layers,
                 len(self.layers),
                 _SP_LAYER_MIN_TOKENS,
+                _SP_ATTN_REDUCE_SCATTER,
                 _SP_MOE_REDUCE_SCATTER,
                 _SP_MOE_DEEPSYMM and has_deep_symm(),
             )

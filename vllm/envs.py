@@ -323,6 +323,7 @@ if TYPE_CHECKING:
     VLLM_GLM_SP_LAYER: bool = False
     VLLM_GLM_SP_LAYER_MIN_TOKENS: int = 128
     VLLM_GLM_SP_MOE_RS: bool = True
+    VLLM_GLM_SP_ATTN_RS: bool = True
     VLLM_GLM_DEEPSYMM: bool = False
 
 
@@ -2159,6 +2160,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_GLM_SP_LAYER_MIN_TOKENS", "128")
     ),
     "VLLM_GLM_SP_MOE_RS": lambda: bool(int(os.getenv("VLLM_GLM_SP_MOE_RS", "1"))),
+    "VLLM_GLM_SP_ATTN_RS": lambda: bool(int(os.getenv("VLLM_GLM_SP_ATTN_RS", "1"))),
     "VLLM_GLM_DEEPSYMM": lambda: bool(int(os.getenv("VLLM_GLM_DEEPSYMM", "0"))),
 }
 
