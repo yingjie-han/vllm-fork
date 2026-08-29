@@ -1,38 +1,101 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+mod structural_tag;
+
+use std::sync::Arc;
+
 use winnow::ascii::multispace0 as ws0;
 use winnow::combinator::{alt, delimited, eof, repeat, seq, terminated};
 use winnow::prelude::*;
 use winnow::stream::Partial;
 use winnow::token::{literal, rest, take_until};
 
+use self::structural_tag::HyStructuralTagBuilder;
 use super::parameters::ToolSchemas;
 use super::utils::{MarkerScanState, parse_buffered_event, safe_text_len, take_until_marker};
-use super::{Result, ToolCallDelta, ToolParser, ToolParserOutput};
+use super::{Result, ToolCallDelta, ToolParser, ToolParserError, ToolParserOutput};
 use crate::tool::{StructuralTagBuilder, Tool};
 
-const TOOL_CALLS_START: &str = "<tool_calls>";
-const TOOL_CALLS_END: &str = "</tool_calls>";
-const TOOL_CALL_START: &str = "<tool_call>";
-const TOOL_CALL_END: &str = "</tool_call>";
-const TOOL_SEP: &str = "<tool_sep>";
-const ARG_KEY_START: &str = "<arg_key>";
-const ARG_KEY_END: &str = "</arg_key>";
-const ARG_VALUE_START: &str = "<arg_value>";
-const ARG_VALUE_END: &str = "</arg_value>";
+/// Wire-level HY tool-call dialect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HyDialect {
+    V3,
+    V4,
+}
 
-type HyV3Input<'i> = Partial<&'i str>;
+impl HyDialect {
+    fn separator(self) -> &'static str {
+        match self {
+            Self::V3 => "\n",
+            Self::V4 => "",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::V3 => "HY3",
+            Self::V4 => "HY4",
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum HyV3Mode {
+pub(crate) struct HyToolMarkers {
+    tool_calls_start: String,
+    tool_calls_end: String,
+    tool_call_start: String,
+    tool_call_end: String,
+    tool_sep: Option<String>,
+    arg_key_start: String,
+    arg_key_end: String,
+    arg_value_start: String,
+    arg_value_end: String,
+}
+
+impl HyToolMarkers {
+    pub(crate) fn new(suffix: &str, dialect: HyDialect) -> Self {
+        Self {
+            tool_calls_start: format!("<tool_calls{suffix}>"),
+            tool_calls_end: format!("</tool_calls{suffix}>"),
+            tool_call_start: format!("<tool_call{suffix}>"),
+            tool_call_end: format!("</tool_call{suffix}>"),
+            tool_sep: (dialect == HyDialect::V3).then(|| format!("<tool_sep{suffix}>")),
+            arg_key_start: format!("<arg_key{suffix}>"),
+            arg_key_end: format!("</arg_key{suffix}>"),
+            arg_value_start: format!("<arg_value{suffix}>"),
+            arg_value_end: format!("</arg_value{suffix}>"),
+        }
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &str> {
+        [
+            Some(self.tool_calls_start.as_str()),
+            Some(self.tool_calls_end.as_str()),
+            Some(self.tool_call_start.as_str()),
+            Some(self.tool_call_end.as_str()),
+            self.tool_sep.as_deref(),
+            Some(self.arg_key_start.as_str()),
+            Some(self.arg_key_end.as_str()),
+            Some(self.arg_value_start.as_str()),
+            Some(self.arg_value_end.as_str()),
+        ]
+        .into_iter()
+        .flatten()
+    }
+}
+
+type HyInput<'i> = Partial<&'i str>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HyMode {
     Text,
     ToolBlock { tool_call_end_scan: MarkerScanState },
     Done,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum HyV3Event {
+enum HyEvent {
     Text {
         len: usize,
     },
@@ -45,7 +108,7 @@ enum HyV3Event {
     IgnoredRest,
 }
 
-/// Tool parser for HY3 XML-style tool calls.
+/// Tool parser for HY XML-style tool calls.
 ///
 /// Example tool call content:
 ///
@@ -58,38 +121,45 @@ enum HyV3Event {
 /// ```
 ///
 /// Arguments are emitted only after a full `<tool_call>` block is parsed.
-/// HY3 marker tokens are added-vocabulary tokens rather than tokenizer special
+/// HY marker tokens are added-vocabulary tokens rather than tokenizer special
 /// tokens, so the default `preserve_special_tokens() == false` is sufficient.
-pub struct HyV3ToolParser {
+pub(crate) struct HyToolParser {
     buffer: String,
-    mode: HyV3Mode,
+    mode: HyMode,
     emitted_tool_count: usize,
     tool_parameters: ToolSchemas,
+    dialect: HyDialect,
+    markers: Arc<HyToolMarkers>,
+    structural_tag_builder: HyStructuralTagBuilder,
 }
 
-impl HyV3ToolParser {
-    /// Create a HY3 tool parser.
-    fn new(tools: &[Tool]) -> Self {
+impl HyToolParser {
+    /// Create a HY tool parser for one wire dialect.
+    pub(crate) fn new(tools: &[Tool], suffix: &str, dialect: HyDialect) -> Self {
+        let markers = Arc::new(HyToolMarkers::new(suffix, dialect));
         Self {
             buffer: String::new(),
-            mode: HyV3Mode::Text,
+            mode: HyMode::Text,
             emitted_tool_count: 0,
             tool_parameters: ToolSchemas::from_tools(tools),
+            dialect,
+            markers: Arc::clone(&markers),
+            structural_tag_builder: HyStructuralTagBuilder::new(markers, dialect),
         }
     }
 
-    /// Apply one parsed HY3 event to parser state and output.
-    fn apply_event(&mut self, event: HyV3Event, output: &mut ToolParserOutput) -> Result<()> {
+    /// Apply one parsed HY event to parser state and output.
+    fn apply_event(&mut self, event: HyEvent, output: &mut ToolParserOutput) -> Result<()> {
         match event {
-            HyV3Event::Text { len: consumed_len } => {
+            HyEvent::Text { len: consumed_len } => {
                 output.push_text(&self.buffer[..consumed_len]);
             }
-            HyV3Event::ToolBlockStart => {
-                self.mode = HyV3Mode::ToolBlock {
+            HyEvent::ToolBlockStart => {
+                self.mode = HyMode::ToolBlock {
                     tool_call_end_scan: MarkerScanState::default(),
                 };
             }
-            HyV3Event::ToolCall { name, raw_params } => {
+            HyEvent::ToolCall { name, raw_params } => {
                 let arguments = self.tool_parameters.convert_params_with_schema(&name, raw_params);
                 let arguments = serde_json::to_string(&arguments)
                     .map_err(|error| parsing_failed!("failed to serialize arguments: {}", error))?;
@@ -101,30 +171,34 @@ impl HyV3ToolParser {
                 });
                 self.emitted_tool_count += 1;
             }
-            HyV3Event::ToolBlockEnd => self.mode = HyV3Mode::Done,
-            HyV3Event::IgnoredRest => {}
+            HyEvent::ToolBlockEnd => self.mode = HyMode::Done,
+            HyEvent::IgnoredRest => {}
         }
         Ok(())
     }
 }
 
-impl ToolParser for HyV3ToolParser {
-    fn create(tools: &[Tool]) -> Result<Box<dyn ToolParser>>
+impl ToolParser for HyToolParser {
+    // Suffix discovery belongs to the unified HY parser so its reasoning and
+    // tool delimiters always use the same tokenizer-derived value.
+    fn create(_tools: &[Tool]) -> Result<Box<dyn ToolParser>>
     where
         Self: Sized + 'static,
     {
-        Ok(Box::new(Self::new(tools)))
+        Err(ToolParserError::DummyUnifiedParser {
+            name: "hy".to_string(),
+        })
     }
 
     fn structural_tag_builder(&self) -> Option<&dyn StructuralTagBuilder> {
-        Some(xgrammar_structural_tag::Model::HyV3.builder())
+        Some(&self.structural_tag_builder)
     }
 
     fn parse_into(&mut self, chunk: &str, output: &mut ToolParserOutput) -> Result<()> {
         self.buffer.push_str(chunk);
 
         while let Some((event, consumed_len)) = parse_buffered_event(&self.buffer, |input| {
-            parse_next_hy_v3_event(input, &mut self.mode)
+            parse_next_hy_event(input, &mut self.mode, &self.markers, self.dialect)
         })? {
             self.apply_event(event, output)?;
             self.buffer.drain(..consumed_len);
@@ -136,113 +210,177 @@ impl ToolParser for HyV3ToolParser {
     fn finish(&mut self) -> Result<ToolParserOutput> {
         let mut output = ToolParserOutput::default();
         match self.mode {
-            HyV3Mode::Text => output.push_text(&self.buffer),
-            HyV3Mode::ToolBlock { .. } => return Err(parsing_failed!("incomplete HY3 tool call")),
-            HyV3Mode::Done => {}
+            HyMode::Text => output.push_text(&self.buffer),
+            HyMode::ToolBlock { .. } => {
+                return Err(parsing_failed!(
+                    "incomplete {} tool call",
+                    self.dialect.label()
+                ));
+            }
+            HyMode::Done => {}
         }
         let _ = self.reset();
         Ok(output)
     }
 
     fn reset(&mut self) -> String {
-        self.mode = HyV3Mode::Text;
+        self.mode = HyMode::Text;
         self.emitted_tool_count = 0;
         std::mem::take(&mut self.buffer)
     }
 }
 
-/// Parse a HY3 event for the current parser mode.
-fn parse_next_hy_v3_event(
-    input: &mut HyV3Input<'_>,
-    mode: &mut HyV3Mode,
-) -> ModalResult<HyV3Event> {
+/// Parse a HY event for the current parser mode.
+fn parse_next_hy_event(
+    input: &mut HyInput<'_>,
+    mode: &mut HyMode,
+    markers: &HyToolMarkers,
+    dialect: HyDialect,
+) -> ModalResult<HyEvent> {
     match mode {
-        HyV3Mode::Text => parse_text_event(input),
-        HyV3Mode::ToolBlock { tool_call_end_scan } => {
-            parse_tool_block_event(input, tool_call_end_scan)
+        HyMode::Text => parse_text_event(input, markers),
+        HyMode::ToolBlock { tool_call_end_scan } => {
+            parse_tool_block_event(input, tool_call_end_scan, markers, dialect)
         }
-        HyV3Mode::Done => ignored_rest_event(input),
+        HyMode::Done => ignored_rest_event(input),
     }
 }
 
-/// Parse a text-mode HY3 event.
-fn parse_text_event(input: &mut HyV3Input<'_>) -> ModalResult<HyV3Event> {
-    alt((tool_block_start_event, safe_text_event)).parse_next(input)
-}
-
-/// Parse a HY3 tool-block start marker.
-fn tool_block_start_event(input: &mut HyV3Input<'_>) -> ModalResult<HyV3Event> {
-    literal(TOOL_CALLS_START).value(HyV3Event::ToolBlockStart).parse_next(input)
-}
-
-/// Parse a safe text run before the next HY3 marker.
-fn safe_text_event(input: &mut HyV3Input<'_>) -> ModalResult<HyV3Event> {
-    safe_text_len(input, TOOL_CALLS_START).map(|len| HyV3Event::Text { len })
-}
-
-/// Parse one event inside a HY3 tool block.
-fn parse_tool_block_event(
-    input: &mut HyV3Input<'_>,
-    tool_call_end_scan: &mut MarkerScanState,
-) -> ModalResult<HyV3Event> {
-    alt((tool_block_end_event, |input: &mut HyV3Input<'_>| {
-        tool_call_event(input, tool_call_end_scan)
-    }))
+/// Parse a text-mode HY event.
+fn parse_text_event(input: &mut HyInput<'_>, markers: &HyToolMarkers) -> ModalResult<HyEvent> {
+    alt((
+        |input: &mut HyInput<'_>| tool_block_start_event(input, markers),
+        |input: &mut HyInput<'_>| safe_text_event(input, markers),
+    ))
     .parse_next(input)
 }
 
-/// Parse a HY3 tool-block end marker.
-fn tool_block_end_event(input: &mut HyV3Input<'_>) -> ModalResult<HyV3Event> {
-    (ws0, literal(TOOL_CALLS_END)).value(HyV3Event::ToolBlockEnd).parse_next(input)
+/// Parse a HY tool-block start marker.
+fn tool_block_start_event(
+    input: &mut HyInput<'_>,
+    markers: &HyToolMarkers,
+) -> ModalResult<HyEvent> {
+    literal(markers.tool_calls_start.as_str())
+        .value(HyEvent::ToolBlockStart)
+        .parse_next(input)
 }
 
-/// Parse a complete HY3 tool-call block.
-fn tool_call_event(
-    input: &mut HyV3Input<'_>,
+/// Parse a safe text run before the next HY marker.
+fn safe_text_event(input: &mut HyInput<'_>, markers: &HyToolMarkers) -> ModalResult<HyEvent> {
+    safe_text_len(input, &markers.tool_calls_start).map(|len| HyEvent::Text { len })
+}
+
+/// Parse one event inside a HY tool block.
+fn parse_tool_block_event(
+    input: &mut HyInput<'_>,
     tool_call_end_scan: &mut MarkerScanState,
-) -> ModalResult<HyV3Event> {
-    let (name, body) = seq!(
+    markers: &HyToolMarkers,
+    dialect: HyDialect,
+) -> ModalResult<HyEvent> {
+    alt((
+        |input: &mut HyInput<'_>| tool_block_end_event(input, markers),
+        |input: &mut HyInput<'_>| tool_call_event(input, tool_call_end_scan, markers, dialect),
+    ))
+    .parse_next(input)
+}
+
+/// Parse a HY tool-block end marker.
+fn tool_block_end_event(input: &mut HyInput<'_>, markers: &HyToolMarkers) -> ModalResult<HyEvent> {
+    (ws0, literal(markers.tool_calls_end.as_str()))
+        .value(HyEvent::ToolBlockEnd)
+        .parse_next(input)
+}
+
+/// Parse a complete HY tool-call block.
+fn tool_call_event(
+    input: &mut HyInput<'_>,
+    tool_call_end_scan: &mut MarkerScanState,
+    markers: &HyToolMarkers,
+    dialect: HyDialect,
+) -> ModalResult<HyEvent> {
+    let (body,) = seq!(
         _: ws0,
-        _: literal(TOOL_CALL_START),
-        take_until(0.., TOOL_SEP),
-        _: literal(TOOL_SEP),
-        take_until_marker(TOOL_CALL_END, tool_call_end_scan),
-        _: literal(TOOL_CALL_END),
+        _: literal(markers.tool_call_start.as_str()),
+        take_until_marker(markers.tool_call_end.as_str(), tool_call_end_scan),
+        _: literal(markers.tool_call_end.as_str()),
     )
     .parse_next(input)?;
-    let raw_params = parse_tool_call_params(body)?;
+    let mut body_input = body;
+    let (name, params) = parse_tool_call_body(&mut body_input, markers, dialect)?;
+    let raw_params = parse_tool_call_params(params, markers)?;
 
-    Ok(HyV3Event::ToolCall {
+    Ok(HyEvent::ToolCall {
         name: name.trim().to_string(),
         raw_params,
     })
 }
 
-/// Parse all parameter blocks inside a complete HY3 tool call.
-fn parse_tool_call_params(tool_call_body: &str) -> ModalResult<Vec<(String, String)>> {
-    let mut input = tool_call_body;
-    delimited(ws0, repeat(0.., terminated(parameter, ws0)), eof).parse_next(&mut input)
+/// Parse a complete HY tool-call body according to its dialect.
+fn parse_tool_call_body<'i>(
+    input: &mut &'i str,
+    markers: &HyToolMarkers,
+    dialect: HyDialect,
+) -> ModalResult<(&'i str, &'i str)> {
+    match dialect {
+        HyDialect::V3 => {
+            let tool_sep = markers.tool_sep.as_deref().expect("HY3 has a tool separator");
+            terminated(
+                seq!(
+                    take_until(0.., tool_sep),
+                    _: literal(tool_sep),
+                    rest,
+                ),
+                eof,
+            )
+            .parse_next(input)
+        }
+        HyDialect::V4 => terminated(
+            alt((
+                seq!(take_until(0.., markers.arg_key_start.as_str()), rest,),
+                rest.map(|name| (name, "")),
+            )),
+            eof,
+        )
+        .parse_next(input),
+    }
 }
 
-/// Parse a HY3 argument key/value block.
-fn parameter(input: &mut &str) -> ModalResult<(String, String)> {
+/// Parse all parameter blocks inside a complete HY tool call.
+fn parse_tool_call_params(
+    tool_call_body: &str,
+    markers: &HyToolMarkers,
+) -> ModalResult<Vec<(String, String)>> {
+    let mut input = tool_call_body;
+    delimited(
+        ws0,
+        repeat(
+            0..,
+            terminated(|input: &mut &str| parameter(input, markers), ws0),
+        ),
+        eof,
+    )
+    .parse_next(&mut input)
+}
+
+/// Parse a HY argument key/value block.
+fn parameter(input: &mut &str, markers: &HyToolMarkers) -> ModalResult<(String, String)> {
     let (name, value) = seq!(
-        _: literal(ARG_KEY_START),
-        take_until(0.., ARG_KEY_END),
-        _: literal(ARG_KEY_END),
+        _: literal(markers.arg_key_start.as_str()),
+        take_until(0.., markers.arg_key_end.as_str()),
+        _: literal(markers.arg_key_end.as_str()),
         _: ws0,
-        _: literal(ARG_VALUE_START),
-        take_until(0.., ARG_VALUE_END),
-        _: literal(ARG_VALUE_END),
+        _: literal(markers.arg_value_start.as_str()),
+        take_until(0.., markers.arg_value_end.as_str()),
+        _: literal(markers.arg_value_end.as_str()),
     )
     .parse_next(input)?;
 
     Ok((name.trim().to_string(), value.to_string()))
 }
 
-/// Parse ignored rest after the HY3 tool block ends.
-fn ignored_rest_event(input: &mut HyV3Input<'_>) -> ModalResult<HyV3Event> {
-    rest.value(HyV3Event::IgnoredRest).parse_next(input)
+/// Parse ignored rest after the HY tool block ends.
+fn ignored_rest_event(input: &mut HyInput<'_>) -> ModalResult<HyEvent> {
+    rest.value(HyEvent::IgnoredRest).parse_next(input)
 }
 
 #[cfg(test)]
@@ -251,7 +389,7 @@ mod tests {
     use serde_json::{Value, json};
     use thiserror_ext::AsReport;
 
-    use super::{HyV3ToolParser, ToolParser};
+    use super::{HyDialect, HyToolParser, ToolParser};
     use crate::tool::test_utils::{collect_stream, split_by_chars, test_tools};
     use crate::tool::{ToolParserOutput, ToolParserTestExt as _};
 
@@ -274,14 +412,14 @@ mod tests {
 
     #[test]
     fn hy_v3_does_not_preserve_special_tokens() {
-        let parser = HyV3ToolParser::new(&test_tools());
+        let parser = HyToolParser::new(&test_tools(), "", HyDialect::V3);
 
         assert!(!parser.preserve_special_tokens());
     }
 
     #[test]
     fn hy_v3_parse_complete_without_tool_call_keeps_text() {
-        let mut parser = HyV3ToolParser::new(&test_tools());
+        let mut parser = HyToolParser::new(&test_tools(), "", HyDialect::V3);
         let output = parser.parse_complete("This is a plain response.").unwrap();
 
         assert_eq!(output.normal_text(), "This is a plain response.");
@@ -290,7 +428,7 @@ mod tests {
 
     #[test]
     fn hy_v3_parse_complete_extracts_zero_arg_inline_tool_call() {
-        let mut parser = HyV3ToolParser::new(&test_tools());
+        let mut parser = HyToolParser::new(&test_tools(), "", HyDialect::V3);
         let output = parser
             .parse_complete(
                 "<tool_calls><tool_call>get_current_date<tool_sep></tool_call></tool_calls>",
@@ -305,7 +443,7 @@ mod tests {
 
     #[test]
     fn hy_v3_parse_complete_extracts_zero_arg_newline_tool_call() {
-        let mut parser = HyV3ToolParser::new(&test_tools());
+        let mut parser = HyToolParser::new(&test_tools(), "", HyDialect::V3);
         let output = parser
             .parse_complete(
                 "<tool_calls>\n<tool_call>get_current_date<tool_sep>\n</tool_call>\n</tool_calls>",
@@ -318,7 +456,7 @@ mod tests {
 
     #[test]
     fn hy_v3_parse_complete_extracts_arguments_on_same_line() {
-        let mut parser = HyV3ToolParser::new(&test_tools());
+        let mut parser = HyToolParser::new(&test_tools(), "", HyDialect::V3);
         let output = parser
             .parse_complete(
                 "<tool_calls><tool_call>get_weather<tool_sep><arg_key>city</arg_key><arg_value>Beijing</arg_value><arg_key>date</arg_key><arg_value>2026-03-30</arg_value></tool_call></tool_calls>",
@@ -333,7 +471,7 @@ mod tests {
 
     #[test]
     fn hy_v3_parse_complete_extracts_arguments_with_newlines() {
-        let mut parser = HyV3ToolParser::new(&test_tools());
+        let mut parser = HyToolParser::new(&test_tools(), "", HyDialect::V3);
         let output = parser
             .parse_complete(&build_tool_calls(&[build_tool_call(
                 "get_weather",
@@ -349,7 +487,7 @@ mod tests {
 
     #[test]
     fn hy_v3_parse_complete_preserves_prefix_and_ignores_trailing_text() {
-        let mut parser = HyV3ToolParser::new(&test_tools());
+        let mut parser = HyToolParser::new(&test_tools(), "", HyDialect::V3);
         let output = parser
             .parse_complete(&format!(
                 "Checking.{} trailing text",
@@ -363,7 +501,7 @@ mod tests {
 
     #[test]
     fn hy_v3_parse_complete_extracts_multiple_tool_calls_in_one_block() {
-        let mut parser = HyV3ToolParser::new(&test_tools());
+        let mut parser = HyToolParser::new(&test_tools(), "", HyDialect::V3);
         let output = parser
             .parse_complete(&build_tool_calls(&[
                 build_tool_call(
@@ -406,7 +544,7 @@ mod tests {
 
     #[test]
     fn hy_v3_parse_complete_converts_schema_types() {
-        let mut parser = HyV3ToolParser::new(&test_tools());
+        let mut parser = HyToolParser::new(&test_tools(), "", HyDialect::V3);
         let output = parser
             .parse_complete(&build_tool_calls(&[build_tool_call(
                 "convert",
@@ -432,7 +570,7 @@ mod tests {
 
     #[test]
     fn hy_v3_streaming_without_tool_call_emits_text_incrementally() {
-        let mut parser = HyV3ToolParser::new(&test_tools());
+        let mut parser = HyToolParser::new(&test_tools(), "", HyDialect::V3);
         let mut output = ToolParserOutput::default();
 
         output.append(parser.parse_chunk("This is ").unwrap());
@@ -446,7 +584,7 @@ mod tests {
 
     #[test]
     fn hy_v3_streaming_extracts_zero_arg_tool_call() {
-        let mut parser = HyV3ToolParser::new(&test_tools());
+        let mut parser = HyToolParser::new(&test_tools(), "", HyDialect::V3);
         let chunks = [
             "<tool_calls>",
             "\n<tool_call>",
@@ -465,7 +603,7 @@ mod tests {
 
     #[test]
     fn hy_v3_streaming_extracts_arguments() {
-        let mut parser = HyV3ToolParser::new(&test_tools());
+        let mut parser = HyToolParser::new(&test_tools(), "", HyDialect::V3);
         let chunks = [
             "<tool_calls>",
             "\n<tool_call>",
@@ -491,7 +629,7 @@ mod tests {
 
     #[test]
     fn hy_v3_streaming_preserves_prefix_text() {
-        let mut parser = HyV3ToolParser::new(&test_tools());
+        let mut parser = HyToolParser::new(&test_tools(), "", HyDialect::V3);
         let chunks = [
             "Checking.",
             "<tool_calls>",
@@ -521,7 +659,7 @@ mod tests {
             ),
         ]);
         let chunks = split_by_chars(&input, 9);
-        let mut parser = HyV3ToolParser::new(&test_tools());
+        let mut parser = HyToolParser::new(&test_tools(), "", HyDialect::V3);
 
         let output = collect_stream(&mut parser, &chunks);
 
@@ -537,7 +675,7 @@ mod tests {
             build_tool_calls(&[build_tool_call("get_weather", &[("city", "Beijing")])])
         );
         let chunks = split_by_chars(&input, 5);
-        let mut parser = HyV3ToolParser::new(&test_tools());
+        let mut parser = HyToolParser::new(&test_tools(), "", HyDialect::V3);
 
         let output = collect_stream(&mut parser, &chunks);
 
@@ -548,7 +686,7 @@ mod tests {
 
     #[test]
     fn hy_v3_streaming_does_not_emit_incomplete_tool_call() {
-        let mut parser = HyV3ToolParser::new(&test_tools());
+        let mut parser = HyToolParser::new(&test_tools(), "", HyDialect::V3);
         let mut output = ToolParserOutput::default();
 
         parser
@@ -564,7 +702,7 @@ mod tests {
 
     #[test]
     fn hy_v3_finish_fails_incomplete_tool_call() {
-        let mut parser = HyV3ToolParser::new(&test_tools());
+        let mut parser = HyToolParser::new(&test_tools(), "", HyDialect::V3);
         parser.parse_chunk("<tool_calls><tool_call>get_weather<tool_sep>").unwrap();
 
         let error = parser.finish().unwrap_err();
@@ -575,10 +713,84 @@ mod tests {
 
     #[test]
     fn hy_v3_malformed_tool_call_fails_fast() {
-        let mut parser = HyV3ToolParser::new(&test_tools());
+        let mut parser = HyToolParser::new(&test_tools(), "", HyDialect::V3);
         let error = parser
             .parse_complete(
                 "<tool_calls><tool_call>get_weather<tool_sep><arg_key>city</arg_key><arg_value>Beijing</tool_call></tool_calls>",
+            )
+            .unwrap_err();
+
+        assert!(error.to_report_string().starts_with("tool parser parsing failed:"));
+    }
+
+    #[test]
+    fn hy_v4_parse_complete_extracts_compact_calls_with_and_without_arguments() {
+        let mut parser = HyToolParser::new(&test_tools(), "", HyDialect::V4);
+        let output = parser
+            .parse_complete(
+                "<tool_calls><tool_call>get_weather<arg_key>city</arg_key><arg_value>Beijing</arg_value><arg_key>date</arg_key><arg_value>2026-03-30</arg_value></tool_call><tool_call>get_current_date</tool_call></tool_calls>",
+            )
+            .unwrap();
+
+        expect![[r#"
+            ToolParserOutput {
+                events: [
+                    ToolCall(
+                        ToolCallDelta {
+                            tool_index: 0,
+                            name: Some(
+                                "get_weather",
+                            ),
+                            arguments: "{\"city\":\"Beijing\",\"date\":\"2026-03-30\"}",
+                        },
+                    ),
+                    ToolCall(
+                        ToolCallDelta {
+                            tool_index: 1,
+                            name: Some(
+                                "get_current_date",
+                            ),
+                            arguments: "{}",
+                        },
+                    ),
+                ],
+            }
+        "#]]
+        .assert_debug_eq(&output);
+    }
+
+    #[test]
+    fn hy_v4_streaming_handles_markers_split_across_chunks() {
+        let input = "prefix<tool_calls><tool_call>get_weather<arg_key>city</arg_key><arg_value>上海</arg_value></tool_call><tool_call>get_current_date</tool_call></tool_calls>";
+        let chunks = split_by_chars(input, 7);
+        let mut parser = HyToolParser::new(&test_tools(), "", HyDialect::V4);
+
+        let output = collect_stream(&mut parser, &chunks);
+
+        assert_eq!(output.normal_text(), "prefix");
+        assert_eq!(output.calls().len(), 2);
+        assert_eq!(parsed_arguments(&output, 0), json!({ "city": "上海" }));
+        assert_eq!(output.calls()[1].name.as_deref(), Some("get_current_date"));
+        assert_eq!(parsed_arguments(&output, 1), json!({}));
+    }
+
+    #[test]
+    fn hy_v4_finish_reports_its_dialect_for_incomplete_calls() {
+        let mut parser = HyToolParser::new(&test_tools(), "", HyDialect::V4);
+        parser.parse_chunk("<tool_calls><tool_call>get_weather").unwrap();
+
+        let error = parser.finish().unwrap_err();
+
+        expect!["tool parser parsing failed: incomplete HY4 tool call"]
+            .assert_eq(&error.to_report_string());
+    }
+
+    #[test]
+    fn hy_v4_malformed_argument_pair_fails_fast() {
+        let mut parser = HyToolParser::new(&test_tools(), "", HyDialect::V4);
+        let error = parser
+            .parse_complete(
+                "<tool_calls><tool_call>get_weather<arg_key>city</arg_key>Beijing</tool_call></tool_calls>",
             )
             .unwrap_err();
 
