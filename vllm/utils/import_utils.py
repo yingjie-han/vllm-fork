@@ -595,6 +595,11 @@ def has_humming() -> bool:
     return _has_module("humming")
 
 
+def has_deepklox() -> bool:
+    """Whether the optional `deepklox` XPU kernel package is available."""
+    return _has_module("deepklox")
+
+
 def has_quark():
     """Whether the optional `quark` package is available."""
     return _has_module("quark")

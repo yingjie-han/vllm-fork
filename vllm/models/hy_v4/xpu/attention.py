@@ -42,6 +42,7 @@ from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.platforms import current_platform
+from vllm.utils.import_utils import has_deepklox as _has_deepklox
 from vllm.v1.attention.backend import AttentionBackend, AttentionType
 from vllm.v1.attention.selector import get_attn_backend
 
@@ -471,9 +472,16 @@ class HYV4MLAAttention(nn.Module):
             self.use_hpc_gated_mla = hpc_gated_mla_supported(
                 config.gating_type, self.linear_gate
             )
+            self.use_deepklox_gated_mla = (
+                not self.use_hpc_gated_mla
+                and current_platform.is_xpu()
+                and config.gating_type == "elementwise"
+                and _has_deepklox()
+            )
         else:
             self.linear_gate = None
             self.use_hpc_gated_mla = False
+            self.use_deepklox_gated_mla = False
         self.prefix = prefix
 
         # Per-head learnable attention sink. Created BEFORE ``MLAAttention`` so
@@ -714,6 +722,13 @@ class HYV4MLAAttention(nn.Module):
                 # maps straight onto the local attn_out columns.
                 assert hidden_states.is_contiguous() and attn_out.is_contiguous()
                 attn_out = hpc_gated_mla_gemm(
+                    hidden_states,
+                    self.linear_gate.weight,
+                    attn_out,
+                )
+            elif self.use_deepklox_gated_mla:
+                from deepklox import gated_mla_gemm as _dklox_gated_mla_gemm
+                attn_out = _dklox_gated_mla_gemm(
                     hidden_states,
                     self.linear_gate.weight,
                     attn_out,

@@ -24,7 +24,7 @@ from vllm.utils.deep_gemm import (
     fp8_fp4_paged_mqa_logits,
     has_deep_gemm,
 )
-from vllm.utils.import_utils import has_cutedsl
+from vllm.utils.import_utils import has_cutedsl, has_deepklox
 from vllm.utils.torch_utils import (
     LayerNameType,
     _encode_layer_name,
@@ -292,6 +292,160 @@ def kv_cache_as_quant_view(
     return kv_cache.unsqueeze(-2)
 
 
+_FP8_E4M3_LUT: dict[torch.device, torch.Tensor] = {}
+
+
+def _dequant_fp8_via_lut(t: torch.Tensor) -> torch.Tensor:
+    """Dequantize float8_e4m3fn → float32 via a 256-entry LUT (no fp8 kernel)."""
+    dev = t.device
+    if dev not in _FP8_E4M3_LUT:
+        # Build the LUT on CPU where fp8 conversion is reliable.
+        _FP8_E4M3_LUT[dev] = (
+            torch.arange(256, dtype=torch.uint8)
+            .view(torch.float8_e4m3fn)
+            .float()
+            .to(dev)
+        )
+    return _FP8_E4M3_LUT[dev][t.view(torch.uint8).long()]
+
+
+def _fp8_mqa_logits_xpu_f32(
+    q: torch.Tensor,
+    k_fp8: torch.Tensor,
+    k_scale: torch.Tensor,
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+) -> torch.Tensor:
+    """FP8 MQA logits using LUT dequant + per-head float32 mm (XPU-safe)."""
+    M, H, D = q.shape
+    N = k_fp8.shape[0]
+    q_f = _dequant_fp8_via_lut(q)       # [M, H, D]
+    k_f = _dequant_fp8_via_lut(k_fp8)   # [N, D]
+    k_ft = k_f.T.contiguous()           # [D, N]
+    # Per-head mm avoids a [M*H, N] intermediate that can OOM.
+    logits = torch.zeros(M, N, device=q.device, dtype=torch.float32)
+    for h in range(H):
+        score_h = torch.mm(q_f[:, h, :].contiguous(), k_ft)  # [M, N]
+        score_h = (score_h * k_scale) .relu() * weights[:, h : h + 1]
+        logits += score_h
+    arange_n = torch.arange(N, device=q.device)
+    mask = (arange_n[None, :] >= cu_seqlen_ks[:, None]) & (
+        arange_n[None, :] < cu_seqlen_ke[:, None]
+    )
+    return logits.masked_fill(~mask, float("-inf"))
+
+
+def _fp8_paged_mqa_logits_xpu_f32(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    max_model_len: int,
+) -> torch.Tensor:
+    """Paged FP8 MQA logits using LUT dequant + float32 mm (XPU-safe)."""
+    from vllm.utils.math_utils import cdiv
+
+    batch_size, next_n, num_heads, dim = q.size()
+    device = q.device
+    block_size = kv_cache.shape[1]
+
+    if context_lens.dim() > 1:
+        context_lens = context_lens.squeeze(-1)
+
+    if next_n == 1:
+        logits = torch.full(
+            [batch_size, max_model_len],
+            float("-inf"),
+            device=device,
+            dtype=torch.float32,
+        )
+        kv_cache_flat = kv_cache.view(-1, block_size * (dim + 4))
+        for i in range(batch_size):
+            q_i = _dequant_fp8_via_lut(q[i, 0])  # [H, D]
+            w_i = weights[i]                       # [H]
+            seq_len = int(context_lens[i].item())
+            num_pages = cdiv(seq_len, block_size)
+            padded_seq_len = num_pages * block_size
+            pages = block_tables[i, :num_pages]
+            cache = kv_cache_flat[pages]
+            scale_offset = block_size * dim
+            cache_value = _dequant_fp8_via_lut(
+                cache[..., :scale_offset].contiguous().view(torch.uint8)
+            ).view(padded_seq_len, dim)
+            cache_scale = (
+                cache[..., scale_offset:]
+                .view(dtype=torch.float32)
+                .contiguous()
+                .view(padded_seq_len)
+            )
+            score = torch.mm(cache_value, q_i.T.contiguous())  # [seq, H]
+            score = torch.relu(score) * w_i[None, :]
+            score = score.sum(dim=1) * cache_scale
+            logits[i, :seq_len] = score[:seq_len]
+        return logits
+
+    # next_n > 1: speculative decode
+    kv_data, kv_scale = kv_cache[..., :dim], kv_cache[..., dim:]
+    kv_scale = kv_scale.contiguous().view(torch.float)
+    q_f = _dequant_fp8_via_lut(q)
+    kv_f = _dequant_fp8_via_lut(kv_data.contiguous().view(torch.uint8))
+    kv_f = kv_f.view(kv_data.shape) * kv_scale
+    num_block, block_size_k, _, dim_k = kv_f.size()
+    logits = torch.full(
+        [batch_size * next_n, max_model_len],
+        float("-inf"),
+        device=device,
+        dtype=torch.float32,
+    )
+    for i in range(batch_size):
+        context_len = context_lens[i]
+        if context_len.ndim == 0:
+            context_len_i = int(context_len.item())
+            q_offsets = torch.arange(
+                context_len_i - next_n, context_len_i, device=device
+            )
+            context_limit = torch.full(
+                (next_n,), context_len_i, dtype=torch.int32, device=device
+            )
+        else:
+            context_limit = context_len.to(device=device, dtype=torch.int32)
+            q_offsets = context_limit - 1
+        w_slice = (
+            weights[i * next_n : (i + 1) * next_n, :].transpose(0, 1).contiguous()
+        )
+        max_ctx = int(context_limit.max().item())
+        for block_rk in range(cdiv(max_ctx, block_size_k)):
+            block_idx = block_tables[i][block_rk]
+            qx, kx = q_f[i], kv_f[block_idx]
+            k_offsets = torch.arange(
+                block_rk * block_size_k,
+                (block_rk + 1) * block_size_k,
+                device=device,
+            )
+            mask = (k_offsets[None, :] < context_limit[:, None]) & (
+                k_offsets[None, :] <= q_offsets[:, None]
+            )
+            s = torch.where(
+                mask[None, :, :],
+                torch.matmul(
+                    qx.transpose(0, 1).contiguous(),
+                    kx.transpose(0, 1).transpose(1, 2).contiguous(),
+                ),
+                float("-inf"),
+            )
+            s = torch.relu(s) * w_slice[..., None]
+            s = s.sum(dim=0)
+            logits[
+                i * next_n : (i + 1) * next_n,
+                block_rk * block_size_k : (block_rk + 1) * block_size_k,
+            ] = torch.where(
+                k_offsets[None, :] <= q_offsets[:, None], s, float("-inf")
+            )
+    return logits
+
+
 @eager_break_during_capture
 def sparse_attn_indexer(
     hidden_states: torch.Tensor,
@@ -486,16 +640,25 @@ def sparse_attn_indexer(
                     k_quant_cast = k_quant
                     k_scale_cast = k_scale.view(torch.float32).squeeze(-1)
                 if current_platform.is_xpu():
-                    if q_scale_slice is not None:
-                        raise RuntimeError("XPU fp8_mqa_logits does not support FP4 Q")
-                    logits = torch.ops.vllm.xpu_fp8_mqa_logits(
-                        q_slice_cast,
-                        k_quant_cast,
-                        k_scale_cast,
-                        weights[chunk.token_start : chunk.token_end],
-                        cu_seqlen_ks,
-                        cu_seqlen_ke,
-                    )
+                    if has_deepklox():
+                        from deepklox import fp8_mqa_logits as _deepklox_fp8_mqa_logits
+                        logits = _deepklox_fp8_mqa_logits(
+                            q_slice_cast,
+                            k_quant_cast,
+                            k_scale_cast,
+                            weights[chunk.token_start : chunk.token_end],
+                            cu_seqlen_ks,
+                            cu_seqlen_ke,
+                        )
+                    else:
+                        logits = _fp8_mqa_logits_xpu_f32(
+                            q_slice_cast,
+                            k_quant_cast,
+                            k_scale_cast,
+                            weights[chunk.token_start : chunk.token_end],
+                            cu_seqlen_ks,
+                            cu_seqlen_ke,
+                        )
                 else:
                     logits = fp8_fp4_mqa_logits(
                         (q_slice_cast, q_scale_slice),
@@ -585,20 +748,29 @@ def sparse_attn_indexer(
             else padded_q_quant_decode_tokens
         )
         if current_platform.is_xpu():
-            if padded_q_scale is not None:
-                raise RuntimeError("XPU fp8_paged_mqa_logits does not support FP4 Q")
             seq_lens_xpu = (
                 seq_lens[:, -1].contiguous() if seq_lens.ndim == 2 else seq_lens
             )
-            logits = torch.ops.vllm.xpu_fp8_paged_mqa_logits(
-                padded_q_quant_cast,
-                kv_cache,
-                weights[:num_padded_tokens],
-                seq_lens_xpu,
-                decode_metadata.block_table,
-                decode_metadata.schedule_metadata,
-                max_model_len,
-            )
+            if has_deepklox():
+                from deepklox import fp8_paged_mqa_logits as _dklox_fp8_paged_mqa_logits
+                logits = _dklox_fp8_paged_mqa_logits(
+                    padded_q_quant_cast,
+                    kv_cache,
+                    weights[:num_padded_tokens],
+                    seq_lens_xpu,
+                    decode_metadata.block_table,
+                    decode_metadata.schedule_metadata,
+                    max_model_len,
+                )
+            else:
+                logits = _fp8_paged_mqa_logits_xpu_f32(
+                    padded_q_quant_cast,
+                    kv_cache,
+                    weights[:num_padded_tokens],
+                    seq_lens_xpu,
+                    decode_metadata.block_table,
+                    max_model_len,
+                )
         else:
             logits = fp8_fp4_paged_mqa_logits(
                 (padded_q_quant_cast, padded_q_scale),

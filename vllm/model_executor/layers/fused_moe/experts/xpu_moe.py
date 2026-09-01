@@ -32,13 +32,41 @@ if current_platform.is_xpu():
 
 
 <<<<<<< HEAD
+<<<<<<< HEAD
 =======
+=======
+def _ensure_e8m0_scale(scale: torch.Tensor | None) -> torch.Tensor | None:
+    """View uint8 block scales as float8_e8m0fnu for the XPU grouped GEMM."""
+    if scale is not None and scale.dtype == torch.uint8:
+        return scale.view(torch.float8_e8m0fnu)
+    return scale
+
+
+def _to_mn_major_e8m0(scale: torch.Tensor | None) -> torch.Tensor | None:
+    """Reorder an e8m0 block-scale tensor so that N is the dense (stride-1) dim.
+
+    The XE3 grouped GEMM requires ``ptr_B_scale`` dense along N.  Checkpoint
+    scales are ``[E, N, ceil(K/block)]`` contiguous (K-dense); this helper
+    makes the underlying storage ``[E, ceil(K/block), N]`` contiguous and
+    returns the ``[E, N, ceil(K/block)]`` transposed *view* so N has stride 1.
+    """
+    if scale is None or scale.ndim != 3 or scale.dtype != torch.float8_e8m0fnu:
+        return scale
+    return scale.transpose(-1, -2).contiguous().transpose(-1, -2)
+
+
+>>>>>>> 2d5c499c5a ([XPU] Add Hy4-preview-FP8 support and integrate ihc, gated_mla and mqa_logits from deepklox)
 def prepare_fp8_moe_layer_for_xpu(
     w13: torch.Tensor,
     w13_scale: torch.Tensor,
     w2: torch.Tensor,
     w2_scale: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    # The XPU grouped GEMM kernel requires e8m0 scale pointers; checkpoints
+    # may store them as raw uint8, so reinterpret when needed.
+    w13_scale = _ensure_e8m0_scale(w13_scale)
+    w2_scale = _ensure_e8m0_scale(w2_scale)
+
     # Only XE2 (BMG/PVC/LNL) wants block scales transposed; the XE3 grouped
     # GEMM takes them in the loaded [E, ceil(N/128), ceil(K/128)] layout.
     if torch.ops._xpu_C.is_xe2_arch():
@@ -73,14 +101,24 @@ def prepare_mxfp4_moe_scales_for_xpu(
     if not is_xe3p_device():
         return w13_scale, w2_scale
 
-    def _to_mn_major_e8m0(scale: torch.Tensor | None) -> torch.Tensor | None:
-        if scale is None or scale.ndim != 3:
-            return scale
-        if scale.dtype == torch.uint8:
-            scale = scale.view(torch.float8_e8m0fnu)
-        return scale.transpose(-1, -2).contiguous().transpose(-1, -2)
+    return (
+        _to_mn_major_e8m0(_ensure_e8m0_scale(w13_scale)),
+        _to_mn_major_e8m0(_ensure_e8m0_scale(w2_scale)),
+    )
 
-    return _to_mn_major_e8m0(w13_scale), _to_mn_major_e8m0(w2_scale)
+
+def prepare_mxfp8_moe_scales_for_xpu(
+    w13_scale: torch.Tensor | None,
+    w2_scale: torch.Tensor | None,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    # Same MN-major e8m0 layout requirement as MXFP4 on XE3.
+    if not is_xe3p_device():
+        return w13_scale, w2_scale
+
+    return (
+        _to_mn_major_e8m0(_ensure_e8m0_scale(w13_scale)),
+        _to_mn_major_e8m0(_ensure_e8m0_scale(w2_scale)),
+    )
 
 
 >>>>>>> f12e3567f4 ([XPU] Add hy4-preview support on XPU with reduced model on single card (#254))

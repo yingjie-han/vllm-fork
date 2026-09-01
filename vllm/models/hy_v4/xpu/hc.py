@@ -22,6 +22,17 @@ from transformers import PretrainedConfig
 
 from vllm.model_executor.layers.hpc import HpcIHCHead, HpcIHCPost, HpcIHCPre
 from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.platforms import current_platform
+from vllm.utils.import_utils import has_deepklox as _has_deepklox
+
+_USE_DEEPKLOX_IHC: bool | None = None
+
+
+def _use_deepklox_ihc() -> bool:
+    global _USE_DEEPKLOX_IHC
+    if _USE_DEEPKLOX_IHC is None:
+        _USE_DEEPKLOX_IHC = current_platform.is_xpu() and _has_deepklox()
+    return _USE_DEEPKLOX_IHC
 
 
 class HYV4HCPreLayer(nn.Module):
@@ -107,6 +118,18 @@ class HYV4HCPreLayer(nn.Module):
         if self.hpc_op is not None:
             return self.hpc_op(x)
 
+        if _use_deepklox_ihc():
+            from deepklox import ihc_pre
+            return ihc_pre(
+                x,
+                self.hc_fn.weight,
+                self.hc_scale,
+                self.hc_base,
+                self.layernorm_epsilon,
+                self.hc_eps,
+                self.magnitude,
+            )
+
         shape = x.size()  # [num_tokens, hc, d]
         hc = self.hc_mult
         hc_eps = self.hc_eps
@@ -175,6 +198,10 @@ class HYV4HCPostLayer(nn.Module):
         """
         if self.hpc_op is not None:
             return self.hpc_op(x, residual, post)
+
+        if _use_deepklox_ihc():
+            from deepklox import ihc_post
+            return ihc_post(x, residual, post)
 
         dtype = x.dtype
         x = x.float()
@@ -259,6 +286,17 @@ class HYV4HCHeadLayer(nn.Module):
         """
         if self.hpc_op is not None:
             return self.hpc_op(x)
+
+        if _use_deepklox_ihc():
+            from deepklox import ihc_head
+            return ihc_head(
+                x,
+                self.hc_head_fn.weight,
+                self.hc_head_scale,
+                self.hc_head_base,
+                self.config.rms_norm_eps,
+                self.hc_eps,
+            )
 
         shape, x_dtype = x.size(), x.dtype
 
