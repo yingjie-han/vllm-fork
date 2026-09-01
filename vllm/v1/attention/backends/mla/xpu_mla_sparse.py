@@ -26,6 +26,7 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.mla.flashmla_sparse import (
     triton_convert_req_index_to_global_index,
 )
+from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.attention.ops.xpu_mla_sparse import triton_bf16_mla_sparse_interface
 from vllm.v1.kv_cache_interface import AttentionSpec
 
@@ -86,6 +87,10 @@ class XPUMLASparseMetadata(AttentionMetadata):
     num_reqs: int
     max_query_len: int
     max_seq_len: int
+    num_decodes: int
+    num_prefills: int
+    num_decode_tokens: int
+    prefill_max_seq_len: int
 
     num_actual_tokens: int  # Number of tokens excluding padding.
     query_start_loc: torch.Tensor
@@ -94,6 +99,8 @@ class XPUMLASparseMetadata(AttentionMetadata):
     block_table: torch.Tensor
     req_id_per_token: torch.Tensor
 
+    prefill: None = None
+    decode: None = None
     block_size: int = 1
     topk_tokens: int = 2048
 
@@ -142,6 +149,9 @@ class XPUMLASparseMetadataBuilder(AttentionMetadataBuilder[XPUMLASparseMetadata]
         fast_build: bool = False,
     ) -> XPUMLASparseMetadata:
         num_tokens = common_attn_metadata.num_actual_tokens
+        num_decodes, num_prefills, num_decode_tokens, _ = (
+            split_decodes_and_prefills(common_attn_metadata)
+        )
         starts = np.asarray(common_attn_metadata.query_start_loc_cpu, dtype=np.int32)
         seg_lengths = np.diff(starts)
         req_id_per_token = np.repeat(
@@ -159,6 +169,10 @@ class XPUMLASparseMetadataBuilder(AttentionMetadataBuilder[XPUMLASparseMetadata]
             num_reqs=common_attn_metadata.num_reqs,
             max_query_len=common_attn_metadata.max_query_len,
             max_seq_len=common_attn_metadata.max_seq_len,
+            num_decodes=num_decodes,
+            num_prefills=num_prefills,
+            num_decode_tokens=num_decode_tokens,
+            prefill_max_seq_len=common_attn_metadata.max_seq_len,
             num_actual_tokens=common_attn_metadata.num_actual_tokens,
             query_start_loc=common_attn_metadata.query_start_loc,
             slot_mapping=common_attn_metadata.slot_mapping,
@@ -172,6 +186,8 @@ class XPUMLASparseMetadataBuilder(AttentionMetadataBuilder[XPUMLASparseMetadata]
 
 class XPUMLASparseImpl(MLAAttentionImpl[XPUMLASparseMetadata]):
     is_sparse = True
+    supports_dense_mha_prefill = False
+    masked_mha_available = False
 
     def __init__(
         self,

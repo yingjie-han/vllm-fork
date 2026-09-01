@@ -14,9 +14,9 @@ The package is organized like `vllm.models.deepseek_v32`: this module is the
 only public entry point and dispatches on the current platform, so registry
 entries never reach into a platform subpackage.
 
-Only NVIDIA is supported for now. The port also drops the reference
-implementation's HPC/TPCP fusion paths, which depend on infrastructure that
-does not exist in this tree.
+CUDA and XPU have isolated implementation packages. The port also drops the
+reference implementation's HPC/TPCP fusion paths, which depend on
+infrastructure that does not exist in this tree.
 """
 
 from vllm.platforms import current_platform
@@ -24,9 +24,9 @@ from vllm.platforms import current_platform
 if current_platform.is_rocm():
     raise NotImplementedError("hy_v4 does not yet support ROCm.")
 elif current_platform.is_xpu():
-    raise NotImplementedError("hy_v4 does not yet support XPU.")
+    from .xpu.model import HYV4ForCausalLM
+    from .xpu.mtp import HYV4MTP
 else:
-    # Covers Blackwell (sm100) and all other CUDA devices.
     from .nvidia.model import HYV4ForCausalLM
     from .nvidia.mtp import HYV4MTP
 
