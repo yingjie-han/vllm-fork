@@ -38,6 +38,7 @@ class XPUMxFp8LinearKernel(Mxfp8LinearKernel):
         scale_kn = weight_scale.data.t().contiguous()
         replace_parameter(layer, "weight_scale", scale_kn.t())
 
+<<<<<<< HEAD
         # Weight is stored as [N, K] and .t()'d to [K, N] in apply. Default keeps
         # it K-contiguous ("ba"); when forced, repack to N-contiguous ("ab")
         # while preserving the [N, K] shape.
@@ -46,6 +47,17 @@ class XPUMxFp8LinearKernel(Mxfp8LinearKernel):
         )
         if force_ab:
             weight_kn = layer.weight.data.t().contiguous().t()
+=======
+        # Weight loads as [N, K] (K-contiguous, "ba"). When forced, store a
+        # physically K-major [K, N] contiguous buffer ("ab") so apply_weights
+        # can feed oneDNN without relying on a transposed view. The bmm path
+        # keeps the [N, K] layout since it builds its own batched buffers.
+        force_ab = envs.VLLM_XPU_MXFP8_FORCE_AB_LAYOUT and not getattr(
+            layer, "is_bmm", False
+        )
+        if force_ab:
+            weight_kn = layer.weight.data.t().contiguous()
+>>>>>>> 44a42177a2 ([XPU] Add env var to force MXFP8 weight into ab layout)
             replace_parameter(layer, "weight", weight_kn)
 
         if getattr(layer, "is_bmm", False):
@@ -80,12 +92,17 @@ class XPUMxFp8LinearKernel(Mxfp8LinearKernel):
     ) -> torch.Tensor:
         out_dtype = x.dtype
         x_fp8, x_scale = quant_mxfp8(x)
-        # Weight is [N, K]; .t() gives a [K, N] view without copying.
+        # Weight is [N, K]; .t() gives a [K, N] view without copying. When
+        # VLLM_XPU_MXFP8_FORCE_AB_LAYOUT is set, weight is already stored as a
+        # contiguous [K, N] buffer, so it is passed directly.
         # Scale is stored as [N, K//32]; .t() recovers the contiguous
         # [K//32, N] buffer that oneDNN expects.
+        weight = layer.weight
+        if not envs.VLLM_XPU_MXFP8_FORCE_AB_LAYOUT:
+            weight = weight.t()
         return torch.ops._xpu_C.fp8_gemm(
             x_fp8,
-            layer.weight.t(),
+            weight,
             out_dtype,
             x_scale,
             layer.weight_scale.t(),

@@ -310,7 +310,11 @@ if TYPE_CHECKING:
     VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
     VLLM_XPU_USE_SAMPLER_KERNEL: bool = True
     VLLM_XPU_USE_CUSTOM_MODEL: bool = False
+<<<<<<< HEAD
     VLLM_XPU_FORCE_AB_LAYOUT_WEIGHT: bool = False
+=======
+    VLLM_XPU_MXFP8_FORCE_AB_LAYOUT: bool = False
+>>>>>>> 44a42177a2 ([XPU] Add env var to force MXFP8 weight into ab layout)
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
     VLLM_NIC_SELECTION_VARS: str = ""
@@ -2112,11 +2116,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_XPU_USE_CUSTOM_MODEL": lambda: bool(
         int(os.getenv("VLLM_XPU_USE_CUSTOM_MODEL", "0"))
     ),
+<<<<<<< HEAD
     # Repack XPU linear weights to an N-contiguous oneDNN "ab" layout instead
     # of the default K-contiguous "ba" layout. Faster for some shapes, but not
     # run-to-run bitwise reproducible. Off by default.
     "VLLM_XPU_FORCE_AB_LAYOUT_WEIGHT": lambda: bool(
         int(os.getenv("VLLM_XPU_FORCE_AB_LAYOUT_WEIGHT", "0"))
+=======
+    # Force MXFP8 linear weights on XPU into a physically K-major ([K, N]
+    # contiguous, "ab") layout instead of the default N-major ([N, K],
+    # K-contiguous, "ba") layout loaded from the checkpoint.
+    "VLLM_XPU_MXFP8_FORCE_AB_LAYOUT": lambda: bool(
+        int(os.getenv("VLLM_XPU_MXFP8_FORCE_AB_LAYOUT", "0"))
+>>>>>>> 44a42177a2 ([XPU] Add env var to force MXFP8 weight into ab layout)
     ),
     # Enable simple KV offload.
     "VLLM_USE_SIMPLE_KV_OFFLOAD": lambda: bool(
