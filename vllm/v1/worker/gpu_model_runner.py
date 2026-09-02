@@ -5524,6 +5524,12 @@ class GPUModelRunner(
         ):
             self.eplb_state.start_async_loop()
 
+        # Must happen before anything reads cudagraph_mode: the wrapper
+        # selection below and torch.compile (triggered by the first forward)
+        # both branch on it, and the attention-support downgrade would
+        # otherwise land after they have already committed.
+        self._resolve_cudagraph_mode_early()
+
         if (
             self.vllm_config.compilation_config.mode
             == CompilationMode.STOCK_TORCH_COMPILE
@@ -7277,6 +7283,48 @@ class GPUModelRunner(
             )
             self.drafter.initialize_attn_backend(kv_cache_config, kernel_block_sizes)
 
+    def _resolve_cudagraph_mode_early(self) -> None:
+        """Resolve `cudagraph_mode` right after the model is built.
+
+        Deriving the attention cudagraph support only needs the KV cache spec
+        and backend classes, none of which allocate memory, so the downgrade
+        (e.g. FULL -> FULL_AND_PIECEWISE) can be settled before the cudagraph
+        wrappers are attached and before torch.compile runs. `initialize_kv_cache`
+        resolves again later; that call is then a no-op.
+        """
+        if self.compilation_config.cudagraph_mode in (None, CUDAGraphMode.NONE):
+            return
+
+        from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
+
+        kv_cache_spec = self.get_kv_cache_spec()
+        if not kv_cache_spec:
+            return
+
+        try:
+            kv_cache_groups = get_kv_cache_groups(self.vllm_config, kv_cache_spec)
+        except Exception:
+            # Grouping is re-done (and will raise there) in initialize_kv_cache;
+            # never let this optimization break startup.
+            logger.debug("Skipping early cudagraph_mode resolution", exc_info=True)
+            return
+
+        layers = get_layers_from_vllm_config(
+            self.vllm_config,
+            cast(type[Any], AttentionLayerBase),
+        )
+        attention_backends = [
+            {
+                layers[layer_name].get_attn_backend()
+                for layer_name in group.layer_names
+                if layer_name in layers
+            }
+            for group in kv_cache_groups
+        ]
+        self._check_and_update_cudagraph_mode(
+            attention_backends, kv_cache_groups, is_profiling=True
+        )
+
     def _check_and_update_cudagraph_mode(
         self,
         attention_backends: list[set[type[AttentionBackend]]],
@@ -7310,7 +7358,7 @@ class GPUModelRunner(
             self.uniform_decode_query_len,
             use_v2_model_runner=False,
             tensor_parallel_size=self.parallel_config.tensor_parallel_size,
-            kv_cache_config=self.kv_cache_config,
+            kv_cache_config=getattr(self, "kv_cache_config", None),
             max_num_reqs=self.max_num_reqs,
             is_profiling=is_profiling,
         )
