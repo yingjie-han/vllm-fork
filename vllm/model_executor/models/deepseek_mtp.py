@@ -124,15 +124,16 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
             hidden_states=hidden_states,
             residual=None,
         )
-        hidden_states = residual + hidden_states  # pre-final-norm (logits hidden)
+        hidden_states = residual + hidden_states  # pre-final-norm
         if self.mtp_block.use_sequence_parallel_moe:
             hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
             hidden_states = hidden_states[: positions.shape[0]]
-        # Recycle the post-final-norm hidden into the next draft step.
-        # compute_logits applies shared_head (== final norm) to the pre-norm
-        # element, so logits and the recycle each get exactly one final-norm.
-        # Matches SGLang's deepseek_nextn.
-        return hidden_states, self.shared_head(hidden_states)
+        # Both the logits hidden and the next-draft-step recycle need exactly
+        # one final norm (matches SGLang's deepseek_nextn), so apply it once
+        # here, inside the compiled region, and hand out the same tensor.
+        # compute_logits() must therefore NOT re-apply shared_head.
+        hidden_states = self.shared_head(hidden_states)
+        return hidden_states, hidden_states
 
 
 class DeepSeekMultiTokenPredictor(nn.Module):
@@ -221,9 +222,8 @@ class DeepSeekMultiTokenPredictor(nn.Module):
     ) -> torch.Tensor:
         current_step_idx = spec_step_idx % self.num_mtp_layers
         mtp_layer = self.layers[str(self.mtp_start_layer_idx + current_step_idx)]
-        logits = self.logits_processor(
-            mtp_layer.shared_head.head, mtp_layer.shared_head(hidden_states)
-        )
+        # forward() already applied shared_head's final norm.
+        logits = self.logits_processor(mtp_layer.shared_head.head, hidden_states)
         return logits
 
 
