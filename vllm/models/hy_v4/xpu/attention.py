@@ -9,7 +9,7 @@ kernel lands. The HPC gated-MLA GEMM *is* wired up: it replaces the eager
 output gating when the hpc package is installed, ``VLLM_ENABLE_HPC_OPS=1``
 and the elementwise/dtype/alignment constraints hold.
 
-The per-head learnable sink is supported through `.flashmla_sparse`, which
+The per-head learnable sink is supported through `.xpu_sparse`, which
 subclasses the platform's sparse MLA backend to forward ``attn_sink``.
 """
 
@@ -272,7 +272,7 @@ class HYV4MLAAttention(nn.Module):
     gate (``gated_mla``) and a per-head learnable attention sink.
 
     The sink is applied by binding the sink-capable backend from
-    `.flashmla_sparse`; if no backend on this platform can consume sinks, the
+    `.xpu_sparse`; if no backend on this platform can consume sinks, the
     weight is still loaded but the bias is disabled with a warning.
     """
 
@@ -352,7 +352,8 @@ class HYV4MLAAttention(nn.Module):
                     "backend is available for current runtime/config. "
                     "Refusing to fall back to dense attention."
                 ) from exc
-
+    # """XPU sparse MLA backend with attention-sink + FP8 KV support for HY V4.
+    # Named ``HYV4XPUMLASparseBackend`` for parity with the NVIDIA counterpart in :mod:`vllm.models.hy_v4.nvidia`."""
         self.scaling = self.qk_head_dim**-0.5
         self.max_position_embeddings = max_position_embeddings
         self.fused_qkv_a_proj = None
@@ -554,7 +555,7 @@ class HYV4MLAAttention(nn.Module):
            `supports_sink`, keep it — this also honours an explicit
            ``--attention-backend`` choice.
         2. Otherwise fall back to the sink-capable ``FLASHMLA_SPARSE`` subclass
-           in `.flashmla_sparse`, whose kernels accept ``attn_sink``, provided
+           in `.xpu_sparse`, whose kernels accept ``attn_sink``, provided
            it validates against the current runtime configuration.
         3. Otherwise give up on the bias rather than failing the load.
 
@@ -591,25 +592,18 @@ class HYV4MLAAttention(nn.Module):
         if selected_cls.supports_sink():
             return selected_cls
 
-        from .flashmla_sparse import HYV4FlashMLASparseBackend
+        from vllm.platforms.interface import DeviceCapability
 
-        # Mirror how the selector derives the configuration-dependent inputs so
-        # this check accepts exactly what the backend would accept at runtime.
-        capability = current_platform.get_device_capability()
-        if capability is None:
-            logger.warning_once(
-                "HYV4 learnable sink is unavailable: the device compute "
-                "capability is unknown. The sink parameter is loaded but the "
-                "sink bias is disabled."
-            )
-            return None
+        from .xpu_sparse import HYV4XPUMLASparseBackend
+
+        capability = current_platform.get_device_capability() or DeviceCapability(0, 0)
         cache_config = get_current_vllm_config().cache_config
         block_size = (
             cache_config.block_size
             if cache_config is not None and cache_config.user_specified_block_size
             else None
         )
-        invalid_reasons = HYV4FlashMLASparseBackend.validate_configuration(
+        invalid_reasons = HYV4XPUMLASparseBackend.validate_configuration(
             head_size=head_size,
             dtype=dtype,
             kv_cache_dtype=cast(CacheDType, kv_cache_dtype),
@@ -638,7 +632,7 @@ class HYV4MLAAttention(nn.Module):
             "FLASHMLA_SPARSE impl instead of %s, which cannot apply sinks.",
             selected_cls.get_name(),
         )
-        return HYV4FlashMLASparseBackend
+        return HYV4XPUMLASparseBackend
 
     def _force_sparse_mqa(self) -> None:
         """Keep every token on the sink-capable sparse MQA path.
