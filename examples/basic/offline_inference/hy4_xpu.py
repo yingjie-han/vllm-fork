@@ -16,6 +16,7 @@ DEFAULT_NUM_LAYERS = 3
 DEFAULT_NUM_EXPERTS = 8
 DEFAULT_SEED = 0
 DEFAULT_FIXTURE_DIR = Path.home() / ".cache" / "vllm" / "hy4-xpu-reduced"
+DEFAULT_PROFILE_DIR = Path.cwd() / "vllm_profile"
 
 TEXT_ASSET_PATTERNS = (
     "chat_template.jinja",
@@ -49,6 +50,13 @@ def _positive_int(value: str) -> int:
     parsed_value = int(value)
     if parsed_value < 1:
         raise argparse.ArgumentTypeError("must be at least 1")
+    return parsed_value
+
+
+def _nonnegative_int(value: str) -> int:
+    parsed_value = int(value)
+    if parsed_value < 0:
+        raise argparse.ArgumentTypeError("must be at least 0")
     return parsed_value
 
 
@@ -94,6 +102,23 @@ def _parse_args() -> argparse.Namespace:
         type=_positive_int,
         default=1,
         help="Number of Intel XPUs used for tensor parallelism.",
+    )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Profile generation with the PyTorch profiler.",
+    )
+    parser.add_argument(
+        "--profile-dir",
+        type=Path,
+        default=DEFAULT_PROFILE_DIR,
+        help="Directory for profiler traces (default: ./vllm_profile).",
+    )
+    parser.add_argument(
+        "--profile-warmups",
+        type=_nonnegative_int,
+        default=1,
+        help="Number of unprofiled warmup requests before profiling.",
     )
     return parser.parse_args()
 
@@ -221,8 +246,19 @@ def main() -> None:
     import torch
 
     from vllm import LLM, SamplingParams
+    from vllm.config import ProfilerConfig
 
     args = _parse_args()
+    profiler_config = None
+    if args.profile:
+        profile_dir = args.profile_dir.expanduser().resolve()
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        profiler_config = ProfilerConfig(
+            profiler="torch",
+            torch_profiler_dir=str(profile_dir),
+        )
+        print(f"Profiler traces: {profile_dir}")
+
     model_path, original_config, reduced_config = materialize_reduced_model(
         args.model,
         args.fixture_dir,
@@ -273,14 +309,24 @@ def main() -> None:
         seed=args.seed,
         gpu_memory_utilization=args.gpu_memory_utilization,
         tensor_parallel_size=args.tp,
+        profiler_config=profiler_config,
     )
     torch.xpu.synchronize()
     init_seconds = time.perf_counter() - init_start
     free_memory_after_init, _ = torch.xpu.mem_get_info()
 
     sampling_params = SamplingParams(temperature=0.0, max_tokens=args.max_tokens)
+    if args.profile:
+        for _ in range(args.profile_warmups):
+            llm.generate([args.prompt], sampling_params, use_tqdm=False)
+        torch.xpu.synchronize()
+        llm.start_profile("hy4_xpu")
     generation_start = time.perf_counter()
-    outputs = llm.generate([args.prompt], sampling_params, use_tqdm=False)
+    try:
+        outputs = llm.generate([args.prompt], sampling_params, use_tqdm=False)
+    finally:
+        if args.profile:
+            llm.stop_profile()
     torch.xpu.synchronize()
     generation_seconds = time.perf_counter() - generation_start
     free_memory_after_generation, _ = torch.xpu.mem_get_info()
