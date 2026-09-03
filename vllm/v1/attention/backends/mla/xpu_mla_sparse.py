@@ -108,6 +108,9 @@ class XPUMLASparseMetadata(AttentionMetadata):
 @dataclass
 class XPUMLASparseMetadataBuilder(AttentionMetadataBuilder[XPUMLASparseMetadata]):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.NEVER
+    # Subclasses that extend the metadata override this so ``build`` keeps
+    # producing the metadata class their impl expects.
+    metadata_cls: ClassVar[type[XPUMLASparseMetadata]] = XPUMLASparseMetadata
 
     def __init__(
         self,
@@ -165,7 +168,7 @@ class XPUMLASparseMetadataBuilder(AttentionMetadataBuilder[XPUMLASparseMetadata]
 
         req_id_per_token = self.req_id_per_token_buffer[:num_tokens]
 
-        metadata = XPUMLASparseMetadata(
+        metadata = self.metadata_cls(
             num_reqs=common_attn_metadata.num_reqs,
             max_query_len=common_attn_metadata.max_query_len,
             max_seq_len=common_attn_metadata.max_seq_len,

@@ -351,6 +351,12 @@ def _canonicalize_sparse_mla_kv_cache_dtype(
     kv_cache_dtype: CacheDType,
 ) -> CacheDType:
     backend_name = attn_backend.get_name()
+    # A backend may know better than the name-keyed table below (e.g. a model
+    # specific subclass that reuses the parent's name but requires a different
+    # cache layout); give it the first say.
+    backend_hook = getattr(attn_backend, "canonicalize_kv_cache_dtype", None)
+    if backend_hook is not None:
+        return backend_hook(kv_cache_dtype)
     if backend_name == "FLASHMLA_SPARSE" and is_quantized_kv_cache(kv_cache_dtype):
         return "fp8_ds_mla"
     if backend_name == "FLASHINFER_MLA_SPARSE_SM120" and kv_cache_dtype in (
