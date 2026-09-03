@@ -5565,6 +5565,12 @@ class GPUModelRunner(
             self.model = CUDAGraphWrapper(
                 self.model, self.vllm_config, runtime_mode=CUDAGraphMode.FULL
             )
+            # Inert unless the drafter's own dispatcher resolves to FULL.
+            drafter = getattr(self, "drafter", None)
+            if drafter is not None and hasattr(drafter, "model"):
+                drafter.model = CUDAGraphWrapper(
+                    drafter.model, self.vllm_config, runtime_mode=CUDAGraphMode.FULL
+                )
         elif self.parallel_config.use_ubatching:
             if cudagraph_mode.has_full_cudagraphs():
                 self.model = UBatchWrapper(
@@ -6280,18 +6286,11 @@ class GPUModelRunner(
                     | Gemma4Proposer,
                 )
                 assert self.speculative_config is not None
-                # Eagle currently only supports PIECEWISE cudagraphs.
-                # Therefore only use cudagraphs if the main model uses PIECEWISE
-                # NOTE(lucas): this is a hack, need to clean up.
+                # The drafter runs its own cudagraph dispatch, so let it capture
+                # during any capture pass and just gate on the target not being
+                # in eager mode.
                 use_cudagraphs = (
-                    (
-                        is_graph_capturing
-                        and cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE
-                    )
-                    or (
-                        not is_graph_capturing
-                        and cudagraph_runtime_mode != CUDAGraphMode.NONE
-                    )
+                    cudagraph_runtime_mode != CUDAGraphMode.NONE
                 ) and not self.speculative_config.enforce_eager
 
                 # Note(gnovack) - We need to disable cudagraphs for one of the two

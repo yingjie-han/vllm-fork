@@ -309,7 +309,7 @@ class Step3p5MTPProposer(EagleProposer):
             self.build_per_group_and_layer_attn_metadata(common_attn_metadata)
         )
 
-        cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
+        cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp, _ = (
             self._determine_batch_execution_and_padding(num_tokens)
         )
 
@@ -373,7 +373,7 @@ class Step3p5MTPProposer(EagleProposer):
 
         draft_token_ids_list = [draft_token_ids]
 
-        cudagraph_runtime_mode, input_batch_size, batch_size_across_dp = (
+        cudagraph_runtime_mode, input_batch_size, batch_size_across_dp, _ = (
             self._determine_batch_execution_and_padding(batch_size)
         )
 
