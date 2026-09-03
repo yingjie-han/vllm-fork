@@ -14,6 +14,7 @@ os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 DEFAULT_MODEL = "tencent/Hy4-preview"
 DEFAULT_NUM_LAYERS = 3
 DEFAULT_NUM_EXPERTS = 8
+DEFAULT_SEED = 0
 DEFAULT_FIXTURE_DIR = Path.home() / ".cache" / "vllm" / "hy4-xpu-reduced"
 
 TEXT_ASSET_PATTERNS = (
@@ -44,11 +45,18 @@ MUTABLE_FIELDS = {
 }
 
 
+def _positive_int(value: str) -> int:
+    parsed_value = int(value)
+    if parsed_value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return parsed_value
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Run a reduced three-layer Hy4 model with random BF16 weights "
-            "on one Intel XPU."
+            "on Intel XPUs."
         )
     )
     parser.add_argument("--model", default=DEFAULT_MODEL)
@@ -74,7 +82,19 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt", default="Explain why the sky appears blue.")
     parser.add_argument("--max-model-len", type=int, default=128)
     parser.add_argument("--max-tokens", type=int, default=1)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=DEFAULT_SEED,
+        help="Random seed for model initialization and sampling.",
+    )
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
+    parser.add_argument(
+        "--tp",
+        type=_positive_int,
+        default=1,
+        help="Number of Intel XPUs used for tensor parallelism.",
+    )
     return parser.parse_args()
 
 
@@ -250,7 +270,9 @@ def main() -> None:
         enforce_eager=True,
         max_model_len=args.max_model_len,
         max_num_seqs=1,
+        seed=args.seed,
         gpu_memory_utilization=args.gpu_memory_utilization,
+        tensor_parallel_size=args.tp,
     )
     torch.xpu.synchronize()
     init_seconds = time.perf_counter() - init_start
