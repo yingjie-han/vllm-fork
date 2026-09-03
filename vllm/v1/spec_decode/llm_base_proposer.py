@@ -261,6 +261,8 @@ class SpecDecodeBaseProposer:
         self._slot_mapping_buffer = torch.zeros(
             self.max_positions, dtype=torch.int64, device=device
         )
+        # Addresses a FULL draft graph baked in, checked again on every replay.
+        self._capture_buffer_ptrs: dict[BatchDescriptor, tuple[int, ...]] = {}
         self._dummy_query_start_loc: dict[tuple[int, int], torch.Tensor] = {}
 
         # Determine allowed attention backends once during initialization.
@@ -740,6 +742,9 @@ class SpecDecodeBaseProposer:
                         common_attn_metadata, draft_index=token_index + 1
                     )
                 )
+
+            if cudagraph_runtime_mode == CUDAGraphMode.FULL:
+                self._check_capture_buffers(batch_desc, common_attn_metadata)
 
             # copy inputs to buffer for cudagraph
             self.input_ids[:batch_size] = input_ids
@@ -1679,12 +1684,17 @@ class SpecDecodeBaseProposer:
 
         query_start_loc_np = self.token_arange_np[: num_reqs + 1] * query_len
         query_start_loc_cpu = torch.from_numpy(query_start_loc_np).clone()
-        # Cached (not a temporary) so the pointer a captured graph may bake in
-        # stays alive and keeps the right contents for its own shape.
-        query_start_loc = self._dummy_query_start_loc.get((num_reqs, query_len))
-        if query_start_loc is None:
-            query_start_loc = query_start_loc_cpu.to(self.device, torch.int32)
-            self._dummy_query_start_loc[(num_reqs, query_len)] = query_start_loc
+        if query_len == 1:
+            # The very tensor propose() passes at replay, so a captured graph
+            # bakes in the address it will actually be replayed with.
+            query_start_loc = self.arange[: num_reqs + 1]
+        else:
+            # Cached (not a temporary) so the pointer a captured graph may bake
+            # in stays alive and keeps the right contents for its own shape.
+            query_start_loc = self._dummy_query_start_loc.get((num_reqs, query_len))
+            if query_start_loc is None:
+                query_start_loc = query_start_loc_cpu.to(self.device, torch.int32)
+                self._dummy_query_start_loc[(num_reqs, query_len)] = query_start_loc
         common_attn_metadata = CommonAttentionMetadata(
             query_start_loc=query_start_loc,
             query_start_loc_cpu=query_start_loc_cpu,
@@ -1703,7 +1713,38 @@ class SpecDecodeBaseProposer:
         _, per_layer_attn_metadata = self.build_per_group_and_layer_attn_metadata(
             common_attn_metadata
         )
+        self._capture_buffer_ptrs[batch_desc] = self._buffer_ptrs(
+            common_attn_metadata
+        )
         return per_layer_attn_metadata
+
+    @staticmethod
+    def _buffer_ptrs(common_attn_metadata: CommonAttentionMetadata) -> tuple[int, ...]:
+        return (
+            common_attn_metadata.seq_lens.data_ptr(),
+            common_attn_metadata.block_table_tensor.data_ptr(),
+            common_attn_metadata.query_start_loc.data_ptr(),
+            common_attn_metadata.slot_mapping.data_ptr(),
+        )
+
+    def _check_capture_buffers(
+        self,
+        batch_desc: BatchDescriptor,
+        common_attn_metadata: CommonAttentionMetadata,
+    ) -> None:
+        """A FULL graph replays the addresses baked in at capture, so metadata
+        living anywhere else would be silently ignored and stale data read."""
+        expected = self._capture_buffer_ptrs.get(batch_desc)
+        if expected is None:
+            return
+        actual = self._buffer_ptrs(common_attn_metadata)
+        if actual != expected:
+            names = ("seq_lens", "block_table_tensor", "query_start_loc", "slot_mapping")
+            moved = [n for n, a, e in zip(names, actual, expected) if a != e]
+            raise RuntimeError(
+                f"Draft FULL cudagraph replay for {batch_desc} would read stale "
+                f"buffers: {moved} moved since capture."
+            )
 
     @torch.inference_mode()
     def dummy_run(
