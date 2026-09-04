@@ -107,7 +107,7 @@ class XPUMLASparseMetadata(AttentionMetadata):
 
 @dataclass
 class XPUMLASparseMetadataBuilder(AttentionMetadataBuilder[XPUMLASparseMetadata]):
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.NEVER
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
     # Subclasses that extend the metadata override this so ``build`` keeps
     # producing the metadata class their impl expects.
     metadata_cls: ClassVar[type[XPUMLASparseMetadata]] = XPUMLASparseMetadata
