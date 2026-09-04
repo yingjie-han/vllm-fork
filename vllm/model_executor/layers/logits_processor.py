@@ -120,8 +120,12 @@ class LogitsProcessor(PluggableLayer):
             )
         if (
             self.head_dtype == torch.float32
-            and (current_platform.is_cuda() or current_platform.is_rocm())
-            and hidden_states.is_cuda
+            and (
+                current_platform.is_cuda()
+                or current_platform.is_rocm()
+                or current_platform.is_xpu()
+            )
+            and hidden_states.device.type in ("cuda", "xpu")
         ):
             # Accumulate the projection directly into fp32. This avoids
             # materializing an fp32 copy of the lm_head weight on every step,
