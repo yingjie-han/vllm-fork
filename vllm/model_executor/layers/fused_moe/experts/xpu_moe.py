@@ -31,10 +31,6 @@ if current_platform.is_xpu():
     from vllm_xpu_kernels.fused_moe_interface import XpuFusedMoe
 
 
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
-=======
 def _ensure_e8m0_scale(scale: torch.Tensor | None) -> torch.Tensor | None:
     """View uint8 block scales as float8_e8m0fnu for the XPU grouped GEMM."""
     if scale is not None and scale.dtype == torch.uint8:
@@ -54,8 +50,6 @@ def _to_mn_major_e8m0(scale: torch.Tensor | None) -> torch.Tensor | None:
         return scale
     return scale.transpose(-1, -2).contiguous().transpose(-1, -2)
 
-
->>>>>>> 2d5c499c5a ([XPU] Add Hy4-preview-FP8 support and integrate ihc, gated_mla and mqa_logits from deepklox)
 def prepare_fp8_moe_layer_for_xpu(
     w13: torch.Tensor,
     w13_scale: torch.Tensor,
@@ -121,7 +115,6 @@ def prepare_mxfp8_moe_scales_for_xpu(
     )
 
 
->>>>>>> f12e3567f4 ([XPU] Add hy4-preview support on XPU with reduced model on single card (#254))
 class XPUExperts(mk.FusedMoEExpertsModular):
     def __init__(
         self,

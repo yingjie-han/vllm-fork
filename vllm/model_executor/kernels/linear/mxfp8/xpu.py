@@ -38,16 +38,6 @@ class XPUMxFp8LinearKernel(Mxfp8LinearKernel):
         scale_kn = weight_scale.data.t().contiguous()
         replace_parameter(layer, "weight_scale", scale_kn.t())
 
-<<<<<<< HEAD
-        # Weight is stored as [N, K] and .t()'d to [K, N] in apply. Default keeps
-        # it K-contiguous ("ba"); when forced, repack to N-contiguous ("ab")
-        # while preserving the [N, K] shape.
-        force_ab = envs.VLLM_XPU_FORCE_AB_LAYOUT_WEIGHT and not getattr(
-            layer, "is_bmm", False
-        )
-        if force_ab:
-            weight_kn = layer.weight.data.t().contiguous().t()
-=======
         # Weight loads as [N, K] (K-contiguous, "ba"). When forced, store a
         # physically K-major [K, N] contiguous buffer ("ab") so apply_weights
         # can feed oneDNN without relying on a transposed view. The bmm path
@@ -57,7 +47,6 @@ class XPUMxFp8LinearKernel(Mxfp8LinearKernel):
         )
         if force_ab:
             weight_kn = layer.weight.data.t().contiguous()
->>>>>>> 44a42177a2 ([XPU] Add env var to force MXFP8 weight into ab layout)
             replace_parameter(layer, "weight", weight_kn)
 
         if getattr(layer, "is_bmm", False):
