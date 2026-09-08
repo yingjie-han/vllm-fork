@@ -1388,7 +1388,11 @@ class xpu_ops:
         indices: torch.Tensor,
         sm_scale: float,
         d_v: int,
+        output: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # When ``output`` is provided, the kernel writes directly into it,
+        # avoiding the extra D2D copy that a caller-side
+        # ``output[...] = sparse_mla_prefill(...)`` assignment would incur.
         if _DEEPKLOX_AVAILABLE:
             out, _, _ = _deepklox_flash_mla_sparse_fwd(
                 q=q,
@@ -1396,6 +1400,7 @@ class xpu_ops:
                 indices=indices,
                 sm_scale=sm_scale,
                 d_v=d_v,
+                out=output,
                 return_softmax_lse=True,
             )
         else:
@@ -1410,6 +1415,7 @@ class xpu_ops:
                 sm_scale=sm_scale,
                 d_v=d_v,
                 block_dpe=0,
+                out=output,
             )
         return out
 

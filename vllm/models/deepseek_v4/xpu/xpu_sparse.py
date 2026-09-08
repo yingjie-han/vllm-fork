@@ -346,10 +346,13 @@ class DeepseekV4XPUAttention(DeepseekV4Attention):
             )
 
             kv_ws = kv[:chunk_size].reshape(-1, 1, q.shape[-1])
-            output[query_start:query_end] = xpu_ops.sparse_mla_prefill(
+            # Write directly into the output slice to avoid an extra D2D
+            # copy from a freshly-allocated kernel output tensor.
+            xpu_ops.sparse_mla_prefill(
                 q=q[query_start:query_end],
                 kv=kv_ws,
                 indices=combined_indices.unsqueeze(1),
                 sm_scale=self.scale,
                 d_v=q.shape[-1],
+                output=output[query_start:query_end],
             )
