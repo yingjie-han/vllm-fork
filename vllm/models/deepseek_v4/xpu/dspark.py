@@ -157,7 +157,11 @@ class DSparkDeepseekV4Model(nn.Module):
         if inputs_embeds is None:
             inputs_embeds = self.embed_input_ids(input_ids)
         # Expand to hc_mult copies for hyper-connections ([T, H] -> [T, hc, H]).
-        hidden_states = inputs_embeds.unsqueeze(-2).repeat(1, self.hc_mult, 1)
+        # expand().contiguous() rather than repeat(): repeat() lands on the
+        # non-vectorized Legacy elementwise path on XPU and runs 1.8x slower.
+        hidden_states = (
+            inputs_embeds.unsqueeze(-2).expand(-1, self.hc_mult, -1).contiguous()
+        )
 
         residual = post_mix = res_mix = None
         for layer in self.layers:
