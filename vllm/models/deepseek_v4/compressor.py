@@ -15,6 +15,7 @@ from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 from vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache import (
     compress_norm_rope_store_triton,
     compress_norm_rope_store_two_stage_triton,
+    compress_norm_rope_store_xpu_mxfp4,
 )
 from vllm.models.deepseek_v4.common.ops.fused_indexer_q import MXFP4_BLOCK_SIZE
 from vllm.models.deepseek_v4.common.ops.save_partial_states import (
@@ -467,6 +468,10 @@ class DeepseekCompressor(nn.Module):
             ):
                 return
             compress_norm_rope_store_fn = compress_norm_rope_store_triton
+            extra_kwargs = {}
+        elif current_platform.is_xpu() and self.use_fp4_cache:
+            # XPU SYCL kernel for MXFP4 indexer path (head_dim=128).
+            compress_norm_rope_store_fn = compress_norm_rope_store_xpu_mxfp4
             extra_kwargs = {}
         elif self._use_two_stage_fused_compressor:
             # head=512 cr>=128 (no overlap): two-pass split compressor on the
