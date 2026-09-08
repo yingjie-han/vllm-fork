@@ -17,11 +17,13 @@ from vllm.models.deepseek_v4.attention import DeepseekV4Attention
 from vllm.models.deepseek_v4.common.ops import (
     combine_topk_swa_indices,
     compute_global_topk_indices_and_lens,
-    dequantize_and_gather_k_cache,
 )
 from vllm.models.deepseek_v4.sparse_mla import (
     DeepseekV4FlashMLAMetadata,
     DeepseekV4SparseMLABackend,
+)
+from vllm.models.deepseek_v4.xpu.xpu_dequant_gather import (
+    dequantize_and_gather_k_cache,
 )
 from vllm.v1.worker.workspace import current_workspace_manager
 
