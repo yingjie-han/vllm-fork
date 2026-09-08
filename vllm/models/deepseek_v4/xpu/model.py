@@ -818,6 +818,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         # Lazy import to avoid top-level tilelang dependency.
         # Registers both torch.ops.vllm.mhc_pre and mhc_post
         import vllm.model_executor.layers.mhc  # noqa: F401
+        from vllm._xpu_ops import xpu_ops
 
         config = vllm_config.model_config.hf_config
         self.hidden_size = config.hidden_size
@@ -833,6 +834,15 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         self.attn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
         self.ffn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
+        # Newer DeepKLOX MHC kernels fold the trailing RMSNorm into their
+        # layer_input write path, removing a standalone rms_norm per norm site.
+        self.mhc_fuse_norm = (
+            xpu_ops.MHC_FUSED_NORM_SUPPORTED
+            and self.hidden_size % 8 == 0
+            and self.hidden_size <= 8192
+            and self.attn_norm.weight.dtype == torch.bfloat16
+            and self.ffn_norm.weight.dtype == torch.bfloat16
+        )
         self.hc_mult = config.hc_mult
         self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
         self.hc_eps = config.hc_eps
@@ -891,6 +901,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         hc_fn: torch.Tensor,
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
+        norm: RMSNorm | None = None,
     ):
         post_mix, res_mix, layer_input = self.mhc_pre(
             residual=x,
@@ -902,6 +913,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             hc_sinkhorn_eps=self.hc_eps,
             hc_post_mult_value=self.hc_post_alpha,
             sinkhorn_repeat=self.hc_sinkhorn_iters,
+            norm_weight=None if norm is None else norm.weight.data,
+            norm_eps=0.0 if norm is None else norm.variance_epsilon,
         )
         return layer_input, post_mix, res_mix
 
@@ -929,7 +942,11 @@ class DeepseekV4DecoderLayer(nn.Module):
             # First layer: run standalone hc_pre
             residual = x
             x, post_mix, res_mix = self.hc_pre(
-                x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+                x,
+                self.hc_attn_fn,
+                self.hc_attn_scale,
+                self.hc_attn_base,
+                norm=self.attn_norm if self.mhc_fuse_norm else None,
             )
         else:
             residual, post_mix, res_mix, x = self.mhc_fused_post_pre(
@@ -945,9 +962,16 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_eps,
                 self.hc_post_alpha,
                 self.hc_sinkhorn_iters,
+                norm_weight=(
+                    self.attn_norm.weight.data if self.mhc_fuse_norm else None
+                ),
+                norm_eps=(
+                    self.attn_norm.variance_epsilon if self.mhc_fuse_norm else 0.0
+                ),
             )
 
-        x = self.attn_norm(x)
+        if not self.mhc_fuse_norm:
+            x = self.attn_norm(x)
         x = self.attn(positions, x, None)
 
         residual, post_mix, res_mix, x = self.mhc_fused_post_pre(
@@ -963,8 +987,11 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_eps,
             self.hc_post_alpha,
             self.hc_sinkhorn_iters,
+            norm_weight=(self.ffn_norm.weight.data if self.mhc_fuse_norm else None),
+            norm_eps=(self.ffn_norm.variance_epsilon if self.mhc_fuse_norm else 0.0),
         )
-        x = self.ffn_norm(x)
+        if not self.mhc_fuse_norm:
+            x = self.ffn_norm(x)
         x = self.ffn(x, input_ids)
         return x, residual, post_mix, res_mix
 

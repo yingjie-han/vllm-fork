@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import inspect
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
@@ -35,6 +36,26 @@ else:
     _mhc_fused_post_pre = torch.ops._xpu_C.mhc_fused_post_pre
     _mhc_post = torch.ops._xpu_C.mhc_post
     _mhc_pre = torch.ops._xpu_C.mhc_pre
+
+
+def _mhc_fused_norm_supported() -> bool:
+    """Whether the MHC kernels can fold the trailing RMSNorm into their
+    ``layer_input`` write path.
+
+    Only newer DeepKLOX builds expose the ``norm_weight`` / ``norm_eps``
+    arguments; the vllm-xpu-kernels fallback does not.
+    """
+    if not _DEEPKLOX_AVAILABLE:
+        return False
+    try:
+        params = inspect.signature(_mhc_pre).parameters
+        post_pre_params = inspect.signature(_mhc_fused_post_pre).parameters
+    except (TypeError, ValueError):
+        return False
+    return "norm_weight" in params and "norm_weight" in post_pre_params
+
+
+MHC_FUSED_NORM_SUPPORTED = _mhc_fused_norm_supported()
 
 if TYPE_CHECKING:
 
@@ -926,6 +947,10 @@ _OPS_REGISTERED = False
 
 
 class xpu_ops:
+    # Whether the MHC kernels can fold the trailing RMSNorm into their
+    # ``layer_input`` write path (newer DeepKLOX builds only).
+    MHC_FUSED_NORM_SUPPORTED = MHC_FUSED_NORM_SUPPORTED
+
     @staticmethod
     @torch.compile
     def dynamic_per_token_int8_quant_ref(
@@ -1245,7 +1270,21 @@ class xpu_ops:
         hc_sinkhorn_eps: float,
         hc_post_mult_value: float,
         sinkhorn_repeat: int,
+        norm_weight: torch.Tensor | None = None,
+        norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if norm_weight is None or not MHC_FUSED_NORM_SUPPORTED:
+            return _mhc_pre(
+                residual,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+            )
         return _mhc_pre(
             residual,
             fn,
@@ -1256,6 +1295,8 @@ class xpu_ops:
             hc_sinkhorn_eps,
             hc_post_mult_value,
             sinkhorn_repeat,
+            norm_weight,
+            norm_eps,
         )
 
     @staticmethod
@@ -1300,7 +1341,24 @@ class xpu_ops:
         hc_sinkhorn_eps: float,
         hc_post_mult_value: float,
         sinkhorn_repeat: int,
+        norm_weight: torch.Tensor | None = None,
+        norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if norm_weight is None or not MHC_FUSED_NORM_SUPPORTED:
+            return _mhc_fused_post_pre(
+                x,
+                residual,
+                post_layer_mix,
+                comb_res_mix,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+            )
         return _mhc_fused_post_pre(
             x,
             residual,
@@ -1314,6 +1372,8 @@ class xpu_ops:
             hc_sinkhorn_eps,
             hc_post_mult_value,
             sinkhorn_repeat,
+            norm_weight,
+            norm_eps,
         )
 
     @staticmethod
