@@ -356,5 +356,6 @@ class DeepseekV4XPUAttention(DeepseekV4Attention):
                 indices=combined_indices.unsqueeze(1),
                 sm_scale=self.scale,
                 d_v=q.shape[-1],
+                topk_length=combined_lens,
                 output=output[query_start:query_end],
             )

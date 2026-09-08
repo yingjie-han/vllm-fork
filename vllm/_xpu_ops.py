@@ -1388,6 +1388,7 @@ class xpu_ops:
         indices: torch.Tensor,
         sm_scale: float,
         d_v: int,
+        topk_length: torch.Tensor | None = None,
         output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # When ``output`` is provided, the kernel writes directly into it,
@@ -1400,6 +1401,7 @@ class xpu_ops:
                 indices=indices,
                 sm_scale=sm_scale,
                 d_v=d_v,
+                topk_length=topk_length,
                 out=output,
                 return_softmax_lse=True,
             )
@@ -1408,6 +1410,9 @@ class xpu_ops:
                 triton_bf16_mla_sparse_interface as _triton_bf16_mla_sparse_interface,
             )
 
+            # The Triton kernel masks purely on `indices >= 0`, so padded
+            # slots (already filled with -1 by combine_topk_swa_indices) are
+            # excluded without needing an explicit topk_length.
             out, _, _ = _triton_bf16_mla_sparse_interface(
                 q=q,
                 kv=kv,
