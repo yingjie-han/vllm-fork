@@ -226,12 +226,18 @@ class SiluAndMulWithClamp(CustomOp):
         self.swiglu_limit = float(swiglu_limit)
         self.alpha = float(alpha)
         self.beta = float(beta)
-        if current_platform.is_rocm() or current_platform.is_xpu():
+        if current_platform.is_rocm() or current_platform.is_cpu():
             self._forward_method = self.forward_native
         elif current_platform.is_cuda_alike():
             self.op = torch.ops._C.silu_and_mul_with_clamp
-        elif current_platform.is_cpu():
-            self._forward_method = self.forward_native
+        elif current_platform.is_xpu():
+            # Only present in recent vllm-xpu-kernels builds; without it the
+            # eager expansion below costs 7 elementwise kernels per call.
+            op = getattr(torch.ops._C, "silu_and_mul_with_clamp", None)
+            if op is None:
+                self._forward_method = self.forward_native
+            else:
+                self.op = op
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2
@@ -247,7 +253,11 @@ class SiluAndMulWithClamp(CustomOp):
         return out
 
     def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
-        return self.forward_native(x)
+        d = x.shape[-1] // 2
+        output_shape = x.shape[:-1] + (d,)
+        out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
+        self.op(out, x.contiguous(), self.swiglu_limit, self.alpha, self.beta)
+        return out
 
     def extra_repr(self) -> str:
         return (
