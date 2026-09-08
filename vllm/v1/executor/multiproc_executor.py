@@ -12,7 +12,7 @@ import weakref
 from collections import deque
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future, InvalidStateError
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import partial
@@ -594,6 +594,59 @@ class WorkerProcHandle:
         )
 
 
+@contextmanager
+def _xpu_worker_device_isolation(vllm_config: VllmConfig, local_rank: int):
+    """Temporarily narrow ZE_AFFINITY_MASK to the single XPU device the
+    about-to-be-spawned worker will use.
+
+    Without this, the child's early SYCL/Level-Zero runtime init (triggered
+    by platform detection at `import vllm` time, before the worker ever
+    calls set_device_index) defaults to device 0, leaking a small context
+    onto device 0 for every worker even though most are assigned elsewhere.
+
+    Opt-in via VLLM_XPU_ISOLATE_WORKER_DEVICES=1. The offset math here must
+    stay in sync with the DP-adjustment in XPUWorker.init_device().
+    """
+    if not (envs.VLLM_XPU_ISOLATE_WORKER_DEVICES and current_platform.is_xpu()):
+        yield
+        return
+
+    parallel_config = vllm_config.parallel_config
+    logical_local_rank = local_rank
+    if (
+        parallel_config.distributed_executor_backend not in ("ray", "external_launcher")
+        and parallel_config.data_parallel_backend != "ray"
+        and parallel_config.nnodes_within_dp == 1
+    ):
+        dp_local_rank = parallel_config.data_parallel_rank_local
+        if dp_local_rank is None:
+            dp_local_rank = parallel_config.data_parallel_index
+        tp_pp_world_size = (
+            parallel_config.pipeline_parallel_size
+            * parallel_config.tensor_parallel_size
+        )
+        logical_local_rank = local_rank + dp_local_rank * tp_pp_world_size
+
+    # Translate through any pre-existing device_control_env_var restriction
+    # or assigned_physical_gpu_ids (e.g. --device-ids) before overwriting the
+    # env var, so the isolation targets the actual physical device rather
+    # than assuming the logical rank is already a physical device id.
+    physical_device_id = current_platform.device_id_to_physical_device_id(
+        logical_local_rank
+    )
+
+    env_var = current_platform.device_control_env_var
+    old_value = os.environ.get(env_var)
+    os.environ[env_var] = str(physical_device_id)
+    try:
+        yield
+    finally:
+        if old_value is None:
+            os.environ.pop(env_var, None)
+        else:
+            os.environ[env_var] = old_value
+
+
 class WorkerProc:
     """Wrapper that runs one Worker in a separate process."""
 
@@ -738,9 +791,14 @@ class WorkerProc:
             daemon=True,
         )
 
-        # Apply NUMA binding if configured
-        with numa_utils.configure_subprocess(
-            vllm_config, local_rank, process_kind="worker"
+        # Apply NUMA binding if configured, and (opt-in) narrow this
+        # worker's device visibility before spawn to avoid device-0 context
+        # leakage; see _xpu_worker_device_isolation.
+        with (
+            _xpu_worker_device_isolation(vllm_config, local_rank),
+            numa_utils.configure_subprocess(
+                vllm_config, local_rank, process_kind="worker"
+            ),
         ):
             proc.start()
 

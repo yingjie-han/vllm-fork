@@ -62,6 +62,14 @@ class XPUWorker(Worker):
         assert current_platform.is_xpu()
 
     def init_device(self):
+        # When VLLM_XPU_ISOLATE_WORKER_DEVICES narrowed this process's
+        # ZE_AFFINITY_MASK to a single device before spawn (see
+        # _xpu_worker_device_isolation in multiproc_executor.py), this process
+        # only ever sees 1 device, always at visible ordinal 0 -- unlike the
+        # DP-shard-level narrowing that logical_device_id_to_visible_device_id
+        # handles, local_rank can't be used to index into that 1-entry list.
+        isolated = bool(os.environ.get(current_platform.device_control_env_var))
+
         # In DP mode, XPU workers see all visible devices.
         # Offset local_rank by the local DP shard.
         parallel_config = self.parallel_config
@@ -80,15 +88,16 @@ class XPUWorker(Worker):
             )
             self.local_rank += dp_local_rank * tp_pp_world_size
 
-            visible_device_count = torch.accelerator.device_count()
-            assert self.local_rank < visible_device_count, (
-                f"DP adjusted local rank {self.local_rank} is out of bounds. "
-            )
-            assert parallel_config.local_world_size <= visible_device_count, (
-                f"local_world_size ({parallel_config.local_world_size}) must "
-                f"be less than or equal to the number of visible devices "
-                f"({visible_device_count})."
-            )
+            if not isolated:
+                visible_device_count = torch.accelerator.device_count()
+                assert self.local_rank < visible_device_count, (
+                    f"DP adjusted local rank {self.local_rank} is out of bounds. "
+                )
+                assert parallel_config.local_world_size <= visible_device_count, (
+                    f"local_world_size ({parallel_config.local_world_size}) must "
+                    f"be less than or equal to the number of visible devices "
+                    f"({visible_device_count})."
+                )
 
         device = self.device_config.device
         if (
@@ -96,12 +105,20 @@ class XPUWorker(Worker):
             and device.type == "xpu"
             and current_platform.is_xpu()
         ):
-            self.device = torch.device(f"xpu:{self.local_rank}")
+            if isolated:
+                visible_device_index = 0
+            else:
+                visible_device_index = (
+                    current_platform.logical_device_id_to_visible_device_id(
+                        self.local_rank
+                    )
+                )
+            self.device = torch.device(f"xpu:{visible_device_index}")
             torch.accelerator.set_device_index(self.device)
             current_platform.check_if_supports_dtype(self.model_config.dtype)
             torch.accelerator.empty_cache()
             self.init_gpu_memory = torch.xpu.get_device_properties(
-                self.local_rank
+                visible_device_index
             ).total_memory
         else:
             raise RuntimeError(f"Unsupported device type: {self.device_config.device}")
@@ -113,6 +130,12 @@ class XPUWorker(Worker):
         os.environ["CCL_ATL_TRANSPORT"] = ENV_CCL_ATL_TRANSPORT
         os.environ["LOCAL_WORLD_SIZE"] = ENV_LOCAL_WORLD_SIZE
         os.environ["LOCAL_RANK"] = str(self.local_rank)
+
+        logger.debug(
+            "worker %s memory snapshot before CCL warm up: %r",
+            self.local_rank,
+            MemorySnapshot(device=self.device),
+        )
 
         init_worker_distributed_environment(
             self.vllm_config,
@@ -139,9 +162,13 @@ class XPUWorker(Worker):
         # take current memory snapshot
         self.init_snapshot = init_snapshot = MemorySnapshot(device=self.device)
         self.requested_memory = request_memory(init_snapshot, self.cache_config)
-        logger.debug("worker init memory snapshot: %r", self.init_snapshot)
         logger.debug(
-            "worker requested memory: %sGiB", format_gib(self.requested_memory)
+            "worker %s init memory snapshot: %r", self.local_rank, self.init_snapshot
+        )
+        logger.debug(
+            "worker %s requested memory: %sGiB",
+            self.local_rank,
+            format_gib(self.requested_memory),
         )
 
         # Initialize workspace manager
