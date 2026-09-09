@@ -605,14 +605,22 @@ class CommonAttentionMetadata:
         # but not the right per-request boundaries. Padding requests have a query
         # length of zero and drop out of the repeat.
         num_mapped_tokens = int(self.query_start_loc_cpu[-1])
-        query_lens = self.query_start_loc[1:] - self.query_start_loc[:-1]
         assert buffer.shape[0] >= max(num_mapped_tokens, num_tokens)
-        token_to_req_indices = torch.repeat_interleave(
-            torch.arange(query_lens.shape[0], dtype=torch.int32, device=buffer.device),
-            query_lens,
-            output_size=num_mapped_tokens,
+        # repeat_interleave parallelises over the repeated (request) dimension, so
+        # a single thread serially writes each request's whole run. query_start_loc
+        # is already sorted, so searchsorted computes the same mapping while
+        # parallelising over tokens instead.
+        torch.searchsorted(
+            self.query_start_loc[1:],
+            torch.arange(
+                num_mapped_tokens,
+                dtype=self.query_start_loc.dtype,
+                device=buffer.device,
+            ),
+            out_int32=True,
+            right=True,
+            out=buffer[:num_mapped_tokens],
         )
-        buffer[:num_mapped_tokens].copy_(token_to_req_indices)
         if num_mapped_tokens < num_tokens:
             buffer[num_mapped_tokens:num_tokens].zero_()
         self._token_to_req_indices_cache = buffer[: max(num_mapped_tokens, num_tokens)]
