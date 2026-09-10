@@ -539,19 +539,6 @@ def convert_to_fp8_moe_kernel_format(
             w2_input_scale=w2_input_scale,
             is_trtllm=(fp8_backend == Fp8MoeBackend.FLASHINFER_TRTLLM),
         )
-    elif fp8_backend == Fp8MoeBackend.XPU:
-        from vllm.model_executor.layers.fused_moe.experts.xpu_moe import (
-            prepare_fp8_moe_layer_for_xpu,
-            prepare_mxfp8_moe_scales_for_xpu,
-        )
-
-        w13, w13_scale, w2, w2_scale = prepare_fp8_moe_layer_for_xpu(
-            w13, w13_scale, w2, w2_scale
-        )
-        if block_quant and getattr(layer, "weight_block_size", None) == [1, 32]:
-            w13_scale, w2_scale = prepare_mxfp8_moe_scales_for_xpu(
-                w13_scale, w2_scale
-            )
     elif fp8_backend == Fp8MoeBackend.CPU:
         from vllm.model_executor.layers.fused_moe.experts.cpu_moe import (
             prepare_fp8_moe_layer_for_cpu,
