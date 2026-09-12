@@ -9,6 +9,7 @@ import ittapi.compat as itt
 import torch
 from typing_extensions import override
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -68,7 +69,10 @@ class XPUWorker(Worker):
         # only ever sees 1 device, always at visible ordinal 0 -- unlike the
         # DP-shard-level narrowing that logical_device_id_to_visible_device_id
         # handles, local_rank can't be used to index into that 1-entry list.
-        isolated = bool(os.environ.get(current_platform.device_control_env_var))
+        # Gate on the same flag as the executor: a user-supplied device mask
+        # (e.g. ZE_AFFINITY_MASK=4,5,6,7) still exposes one device per worker
+        # and must keep going through the normal logical->visible mapping.
+        isolated = envs.VLLM_XPU_ISOLATE_WORKER_DEVICES
 
         # In DP mode, XPU workers see all visible devices.
         # Offset local_rank by the local DP shard.
