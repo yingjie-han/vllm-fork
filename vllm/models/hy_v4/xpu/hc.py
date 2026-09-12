@@ -13,7 +13,8 @@ NOTE: Each of the three steps has an optional single-kernel HPC replacement
 when the hpc package is installed, ``VLLM_ENABLE_HPC_OPS=1`` and the shape /
 device constraints hold; otherwise the eager path below runs unchanged.
 TODO: port the cross-layer post+pre fusion (``HpcIHCPostPre``) as well; it
-requires restructuring the decoder-layer forward scheduling.
+requires restructuring the decoder-layer forward scheduling. The deepklox XPU
+path already does this via ``HYV4HCLayer.post_pre``.
 """
 
 import torch
@@ -33,6 +34,15 @@ def _use_deepklox_ihc() -> bool:
     if _USE_DEEPKLOX_IHC is None:
         _USE_DEEPKLOX_IHC = current_platform.is_xpu() and _has_deepklox()
     return _USE_DEEPKLOX_IHC
+
+
+def _norm_is_foldable(norm: nn.Module) -> bool:
+    """deepklox's ihc_pre fold only accepts a bf16 [H] weight, no var override."""
+    return (
+        getattr(norm, "has_weight", False)
+        and norm.variance_size_override is None
+        and norm.weight.dtype == torch.bfloat16
+    )
 
 
 class HYV4HCPreLayer(nn.Module):
@@ -56,6 +66,7 @@ class HYV4HCPreLayer(nn.Module):
         hc_eps: float = 1e-6,
         layernorm_epsilon: float = 1e-5,
         prefix: str = "",
+        norm_owner: nn.Module | None = None,
     ):
         super().__init__()
         self.config = config
@@ -80,8 +91,8 @@ class HYV4HCPreLayer(nn.Module):
         self.reset_parameters(init_std, base_noise_std)
 
         # Optional single-kernel HPC replacement for the whole forward below.
-        # ``norm_owner`` is left unset: the RMSNorm that follows the pre block
-        # lives in the decoder layer and is not folded in yet.
+        # ``norm_owner`` is left unset: the HPC kernel's own RMSNorm fold is not
+        # wired up yet (the deepklox path below does fold it).
         self.hpc_op: HpcIHCPre | None = None
         if HpcIHCPre.support(hc_mult, hidden_dim):
             self.hpc_op = HpcIHCPre(
@@ -92,6 +103,18 @@ class HYV4HCPreLayer(nn.Module):
                 norm_eps=layernorm_epsilon,
                 fallback_op=self,
             )
+
+        # The norm is a sibling module owned by the decoder layer; stash it
+        # outside nn.Module's machinery so it is not duplicated in state_dict().
+        object.__setattr__(self, "_norm_owner", norm_owner)
+        self.fold_norm = (
+            self.hpc_op is None
+            and norm_owner is not None
+            and _use_deepklox_ihc()
+            and _norm_is_foldable(norm_owner)
+        )
+        # Whether the preceding sub-block's post can be folded into this pre.
+        self.fuse_post_pre = self.hpc_op is None and _use_deepklox_ihc()
 
     def reset_parameters(self, init_std: float, base_noise_std: float = 0.0) -> None:
         """Initialize the gate scale and per-channel gate bias."""
@@ -120,6 +143,8 @@ class HYV4HCPreLayer(nn.Module):
 
         if _use_deepklox_ihc():
             from deepklox import ihc_pre
+
+            norm = self._norm_owner if self.fold_norm else None
             return ihc_pre(
                 x,
                 self.hc_fn.weight,
@@ -128,6 +153,8 @@ class HYV4HCPreLayer(nn.Module):
                 self.layernorm_epsilon,
                 self.hc_eps,
                 self.magnitude,
+                None if norm is None else norm.weight,
+                0.0 if norm is None else norm.variance_epsilon,
             )
 
         shape = x.size()  # [num_tokens, hc, d]
@@ -160,6 +187,39 @@ class HYV4HCPreLayer(nn.Module):
 
         y = torch.sum(pre.unsqueeze(-1) * x.reshape(shape), dim=1)  # [num_tokens, d]
         return y.to(x.dtype), post
+
+    def fused_post_pre(
+        self, x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run a preceding `HYV4HCPostLayer` and this pre block in one kernel.
+
+        Args:
+            x: Preceding sub-block output ``[num_tokens, d]``.
+            residual: That sub-block's multi-channel residual
+                ``[num_tokens, hc, d]``.
+            post: That sub-block's post gates ``[num_tokens, hc]``.
+
+        Returns:
+            ``(y, z, post_out)``: the post output ``[num_tokens, hc, d]``
+            (this block's residual), the reduced hidden state
+            ``[num_tokens, d]``, and this block's post gates.
+        """
+        from deepklox import ihc_fused_post_pre
+
+        norm = self._norm_owner if self.fold_norm else None
+        return ihc_fused_post_pre(
+            x,
+            residual,
+            post,
+            self.hc_fn.weight,
+            self.hc_scale,
+            self.hc_base,
+            self.layernorm_epsilon,
+            self.hc_eps,
+            self.magnitude,
+            None if norm is None else norm.weight,
+            0.0 if norm is None else norm.variance_epsilon,
+        )
 
 
 class HYV4HCPostLayer(nn.Module):
@@ -325,6 +385,7 @@ class HYV4HCLayer(nn.Module):
         init_std: float = 6e-3,
         base_noise_std: float = 0.0,
         prefix: str = "",
+        norm_owner: nn.Module | None = None,
     ):
         super().__init__()
         self.config = config
@@ -341,8 +402,36 @@ class HYV4HCLayer(nn.Module):
                 config.hc_eps,
                 config.rms_norm_eps,
                 prefix=f"{prefix}.hc_pre",
+                norm_owner=norm_owner,
             )
             self.hc_post = HYV4HCPostLayer(config)
+
+    @property
+    def folds_norm(self) -> bool:
+        """Whether `pre` already applies the decoder layer's RMSNorm."""
+        return self.enable_ihc and self.hc_pre.fold_norm
+
+    @property
+    def fuses_post_pre(self) -> bool:
+        """Whether `post_pre` can replace a preceding `post` plus this `pre`."""
+        return self.enable_ihc and self.hc_pre.fuse_post_pre
+
+    def post_pre(
+        self,
+        output_with_bias: torch.Tensor,
+        residual: torch.Tensor,
+        post_gates: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Preceding sub-block's `post` plus this layer's `pre`, in one kernel.
+
+        The preceding post emits a 3D tensor, so `prepare_input` is a no-op and
+        is skipped here. Returns the same triple as `pre`.
+        """
+        assert post_gates is not None
+        y, reduced, post_out = self.hc_pre.fused_post_pre(
+            output_with_bias, residual, post_gates
+        )
+        return reduced, post_out, y
 
     def prepare_input(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Normalize the sub-block input to 3D when iHC is enabled."""

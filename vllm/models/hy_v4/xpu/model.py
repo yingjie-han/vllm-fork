@@ -143,20 +143,29 @@ class HYV4DecoderLayer(nn.Module):
             self.block_type = "moe"
         self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.hc_attn_layer = HYV4HCLayer(
-            config, layer_idx, prefix=f"{prefix}.hc_attn_layer"
+            config,
+            layer_idx,
+            prefix=f"{prefix}.hc_attn_layer",
+            norm_owner=self.input_layernorm,
         )
         self.hc_mlp_layer = HYV4HCLayer(
-            config, layer_idx, prefix=f"{prefix}.hc_mlp_layer"
+            config,
+            layer_idx,
+            prefix=f"{prefix}.hc_mlp_layer",
+            norm_owner=self.post_attention_layernorm,
         )
+        # When set, the MLP post is handed to the next layer's attention pre
+        # instead of being applied here.
+        self.defer_mlp_post = self.hc_attn_layer.fuses_post_pre
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        residual: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        residual: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None]:
         if self.enable_ihc:
-            return self._forward_ihc(positions, hidden_states)
+            return self._forward_ihc(positions, hidden_states, residual)
         return self._forward_normal(positions, hidden_states, residual)
 
     def _forward_normal(
@@ -188,21 +197,43 @@ class HYV4DecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-    ) -> tuple[torch.Tensor, None]:
-        """iHC forward: each sub-block reduces and re-scatters the channels."""
-        hidden_states = self.hc_attn_layer.prepare_input(hidden_states)
-        hidden_states, post_gates, residual = self.hc_attn_layer.pre(hidden_states)
-        hidden_states = self.input_layernorm(hidden_states)
+        pending_post: tuple[torch.Tensor, torch.Tensor] | None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
+        """iHC forward: each sub-block reduces and re-scatters the channels.
+
+        `pending_post` is the previous layer's deferred `(residual, post_gates)`,
+        folded into this layer's attention pre; it is None at the start of a
+        pipeline stage. Returns this layer's own deferred pair when
+        `defer_mlp_post` is set.
+        """
+        if pending_post is None:
+            hidden_states = self.hc_attn_layer.prepare_input(hidden_states)
+            hidden_states, post_gates, residual = self.hc_attn_layer.pre(hidden_states)
+        else:
+            hidden_states, post_gates, residual = self.hc_attn_layer.post_pre(
+                hidden_states, pending_post[0], pending_post[1]
+            )
+        if not self.hc_attn_layer.folds_norm:
+            hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
         )
-        hidden_states = self.hc_attn_layer.post(hidden_states, residual, post_gates)
 
-        hidden_states = self.hc_mlp_layer.prepare_input(hidden_states)
-        hidden_states, post_gates, residual = self.hc_mlp_layer.pre(hidden_states)
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        if self.hc_mlp_layer.fuses_post_pre:
+            hidden_states, post_gates, residual = self.hc_mlp_layer.post_pre(
+                hidden_states, residual, post_gates
+            )
+        else:
+            hidden_states = self.hc_attn_layer.post(hidden_states, residual, post_gates)
+            hidden_states = self.hc_mlp_layer.prepare_input(hidden_states)
+            hidden_states, post_gates, residual = self.hc_mlp_layer.pre(hidden_states)
+        if not self.hc_mlp_layer.folds_norm:
+            hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
+
+        if self.defer_mlp_post:
+            return hidden_states, (residual, post_gates)
         hidden_states = self.hc_mlp_layer.post(hidden_states, residual, post_gates)
 
         # Under iHC the residual is carried inside hidden_states.
@@ -376,6 +407,14 @@ class HYV4Model(nn.Module):
 
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states, residual = layer(positions, hidden_states, residual)
+
+        if self.enable_ihc and residual is not None:
+            # The last layer deferred its MLP post and there is no following
+            # pre to fold it into, so apply it here.
+            last_layer = self.layers[self.end_layer - 1]
+            hidden_states = last_layer.hc_mlp_layer.post(
+                hidden_states, residual[0], residual[1]
+            )
 
         if not get_pp_group().is_last_rank:
             if self.enable_ihc:
