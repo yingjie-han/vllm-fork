@@ -66,8 +66,9 @@ def compute_skip_topk_layers(config: PretrainedConfig) -> set[int]:
         The set of layer indices that share another layer's top-k indices.
 
     Raises:
-        ValueError: If ``indexer_types`` has the wrong length or an unknown
-            entry, or if ``index_topk_freq`` is not a positive integer.
+        ValueError: If ``indexer_types`` is shorter than ``num_hidden_layers``
+            or has an unknown entry, or if ``index_topk_freq`` is not a
+            positive integer.
     """
     if not hasattr(config, "index_topk"):
         return set()
@@ -75,11 +76,23 @@ def compute_skip_topk_layers(config: PretrainedConfig) -> set[int]:
     num_hidden_layers = config.num_hidden_layers
     indexer_types = getattr(config, "indexer_types", None)
     if indexer_types is not None:
-        if len(indexer_types) != num_hidden_layers:
+        if len(indexer_types) < num_hidden_layers:
             raise ValueError(
                 "indexer_types must contain one entry per hidden layer: "
                 f"expected {num_hidden_layers}, got {len(indexer_types)}."
             )
+        if len(indexer_types) > num_hidden_layers:
+            # Tolerates a truncated num_hidden_layers against a full checkpoint
+            # config; the resulting layer pattern is not the released model.
+            logger.warning(
+                "indexer_types has %d entries but num_hidden_layers is %d; "
+                "using the first %d entries. This is not the released model "
+                "layer pattern -- do not use these results for accuracy.",
+                len(indexer_types),
+                num_hidden_layers,
+                num_hidden_layers,
+            )
+            indexer_types = indexer_types[:num_hidden_layers]
         invalid_types = sorted(set(indexer_types) - {"full", "shared"})
         if invalid_types:
             raise ValueError(
