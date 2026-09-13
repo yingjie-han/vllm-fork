@@ -233,30 +233,24 @@ class Indexer(nn.Module):
         """Build the quantized query, key and per-head weights of the indexer."""
         q, _ = self.wq_b(qr)
         q = q.view(-1, self.n_head, self.head_dim)
-        # Checkpoint (PTM) layout: pe occupies the LAST rope_dim dims.
-        q_nope, q_pe = torch.split(
-            q, [self.head_dim - self.rope_dim, self.rope_dim], dim=-1
-        )
 
         kw, _ = self.wk_weights_proj(hidden_states)
-        k = kw[:, : self.head_dim]
         weights = kw[:, self.head_dim :]
+        k = self.k_norm(kw[:, : self.head_dim])
 
-        k = self.k_norm(k)
-        k_nope, k_pe = torch.split(
-            k, [self.head_dim - self.rope_dim, self.rope_dim], dim=-1
-        )
-
-        q_pe, k_pe = rotary_emb(positions, q_pe, k_pe.unsqueeze(1))
-        # RoPE (NeoX) can introduce extra leading dims, so flatten back to the
-        # token-major shapes.
-        q_pe = q_pe.reshape(-1, self.n_head, self.rope_dim)
-        k_pe = k_pe.reshape(-1, 1, self.rope_dim)
-
-        # Reassemble with the original physical layout: no_pe first, pe last.
-        q = torch.cat([q_nope, q_pe], dim=-1)
-        # ``k_pe`` is [num_tokens, 1, rope_dim] (MQA).
-        k = torch.cat([k_nope, k_pe.squeeze(-2)], dim=-1)
+        # The projections already emit the checkpoint (PTM) layout, with pe in
+        # the LAST rope_dim dims, so rope runs on a strided slice in place and
+        # no split/concat round-trip is needed to reassemble q and k.
+        pe_offset = self.head_dim - self.rope_dim
+        q_pe_dst = q[..., pe_offset:]
+        k_pe_dst = k[:, pe_offset:]
+        q_pe, k_pe = rotary_emb(positions, q_pe_dst, k_pe_dst)
+        # The XPU rope op mutates its inputs; only copy back if a fallback
+        # returned fresh tensors, since copying a slice onto itself is an error.
+        if q_pe.data_ptr() != q_pe_dst.data_ptr():
+            q_pe_dst.copy_(q_pe.reshape(q_pe_dst.shape))
+        if k_pe.data_ptr() != k_pe_dst.data_ptr():
+            k_pe_dst.copy_(k_pe.reshape(k_pe_dst.shape))
 
         # Only q is quantized here; k quantization is fused with cache insertion.
         q = q.view(-1, self.head_dim)
