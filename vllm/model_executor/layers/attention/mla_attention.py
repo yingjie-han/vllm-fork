@@ -890,6 +890,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 mqa_pe_padded.copy_(mqa_q_pe)
                 mqa_q_pe = mqa_pe_padded
 
+            mqa_q_fused = False
             if self.is_aiter_triton_fp4_bmm_enabled:
                 from aiter.ops.triton.batched_gemm_a16wfp4 import batched_gemm_a16wfp4
 
@@ -917,19 +918,34 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 assert W_UK_T is not None
                 _, _, L = W_UK_T.shape
 
-                if self.q_pad_num_heads is not None:
+                # The absorb BMM produces head-major (N, B, L) while the kernels
+                # want token-major (B, N, L + P), so the nope/pe concat below is
+                # really a transpose plus a strided scatter. Writing the BMM
+                # straight into the nope half of the final buffer removes it.
+                mqa_q_fused = (
+                    self.q_pad_num_heads is None
+                    and not (fp8_attention and self.impl.supports_quant_query_input)
+                )
+                if mqa_q_fused:
+                    mqa_q = mqa_q_pe.new_empty((B, N, L + mqa_q_pe.shape[-1]))
+                    torch.bmm(mqa_q_nope, W_UK_T, out=mqa_q[:, :, :L].transpose(0, 1))
+                    mqa_q[:, :, L:].copy_(mqa_q_pe)
+                elif self.q_pad_num_heads is not None:
                     mqa_ql_nope = mqa_q_nope.new_empty((self.q_pad_num_heads, B, L))
                     mqa_ql_nope.resize_((N, B, L))
                 else:
                     mqa_ql_nope = mqa_q_nope.new_empty((N, B, L))
 
-                # Multiply (N, B, P) x (N, P, L) -> (N, B, L)
-                torch.bmm(mqa_q_nope, W_UK_T, out=mqa_ql_nope)
+                if not mqa_q_fused:
+                    # Multiply (N, B, P) x (N, P, L) -> (N, B, L)
+                    torch.bmm(mqa_q_nope, W_UK_T, out=mqa_ql_nope)
 
-                # Convert from (N, B, L) to (B, N, L)
-                mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
+                    # Convert from (N, B, L) to (B, N, L)
+                    mqa_ql_nope = mqa_ql_nope.transpose(0, 1)
 
-            if fp8_attention and self.impl.supports_quant_query_input:
+            if mqa_q_fused:
+                pass
+            elif fp8_attention and self.impl.supports_quant_query_input:
                 assert mqa_ql_nope.shape[0] == mqa_q_pe.shape[0]
                 assert mqa_ql_nope.shape[1] == mqa_q_pe.shape[1]
                 mqa_q = self._decode_concat_quant_fp8_op(
