@@ -136,6 +136,14 @@ def is_skip_topk_indexer_weight(weight_name: str, skip_topk_layers: set[int]) ->
     return match is not None and int(match.group(1)) in skip_topk_layers
 
 
+@torch.compile(dynamic=True, backend=current_platform.simple_compile_backend)
+def _scale_indexer_weights(
+    weights: torch.Tensor, q_scale: torch.Tensor, scale: float
+) -> torch.Tensor:
+    """Apply the dequant and softmax scales to the indexer's per-head weights."""
+    return weights * q_scale * scale
+
+
 class Indexer(nn.Module):
     """Lightning indexer selecting the top-k tokens for sparse MLA."""
 
@@ -180,6 +188,7 @@ class Indexer(nn.Module):
         )
         self.k_norm = LayerNorm(self.head_dim, eps=1e-6)
         self.softmax_scale = self.head_dim**-0.5
+        self.weights_scale = self.softmax_scale * self.n_head**-0.5
 
         self.scale_fmt = "ue8m0"
         self.quant_block_size = 128
@@ -261,12 +270,9 @@ class Indexer(nn.Module):
             use_ue8m0=self.scale_fmt is not None,
         )
         q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
-        q_scale = q_scale.view(-1, self.n_head, 1)
-
-        weights = (
-            weights.unsqueeze(-1) * q_scale * self.softmax_scale * self.n_head**-0.5
+        weights = _scale_indexer_weights(
+            weights, q_scale.view(-1, self.n_head), self.weights_scale
         )
-        weights = weights.squeeze(-1)
 
         return hidden_states, q_fp8, k, weights
 
