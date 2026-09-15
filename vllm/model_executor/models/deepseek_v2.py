@@ -120,6 +120,13 @@ from .utils import (
 logger = init_logger(__name__)
 
 
+@torch.compile(dynamic=True, backend=current_platform.simple_compile_backend)
+def _scale_indexer_weights(
+    weights: torch.Tensor, q_scale: torch.Tensor, scale: float
+) -> torch.Tensor:
+    return weights * q_scale * scale
+
+
 def _get_moe_router_dtype(
     config: DeepseekV2Config | DeepseekV3Config,
 ) -> torch.dtype | None:
@@ -803,7 +810,9 @@ class Indexer(nn.Module):
         q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
         q_scale = q_scale.view(-1, self.n_head)
 
-        weights = weights * q_scale * self.softmax_scale * self.n_head_scale
+        weights = _scale_indexer_weights(
+            weights, q_scale, self.softmax_scale * self.n_head_scale
+        )
 
         return self.indexer_op(hidden_states, q_fp8, k, weights)
 
