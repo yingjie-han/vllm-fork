@@ -440,10 +440,13 @@ class HYV4XPUMLASparseImpl(XPUMLASparseImpl):
         q: torch.Tensor,  # [num_tokens, num_heads, dim_qk]
         kv_c_and_k_pe_cache: torch.Tensor,  # [num_blocks, block_size, dim_qk]
         topk_indices: torch.Tensor,  # [num_tokens, topk]
+        topk_length: torch.Tensor | None,  # [num_tokens]
         attn_metadata: XPUMLASparseMetadata,
     ) -> torch.Tensor:
         if self._use_deepklox:
-            output = self._sparse_prefill(q, kv_c_and_k_pe_cache, topk_indices)
+            output = self._sparse_prefill(
+                q, kv_c_and_k_pe_cache, topk_indices, topk_length
+            )
         else:
             # ``triton_bf16_mla_sparse_interface`` expects kv with an explicit
             # h_kv axis and indices reshaped to ``[s_q, h_kv, topk]``.

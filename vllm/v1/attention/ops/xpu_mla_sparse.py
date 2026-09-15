@@ -284,3 +284,11 @@ def triton_bf16_mla_sparse_interface(
     )
 
     return out, max_logits, softmax_lse
+
+
+# fp8_ds_mla packed layout, per token (656 bytes, kv_lora_rank=512, pe_dim=64):
+#   bytes [0, 512)    : 512 float8_e4m3 NoPE values
+#   bytes [512, 528)  : 4 float32 scales, one per 128-element NoPE tile
+#   bytes [528, 656)  : 64 bfloat16 RoPE values (kept unquantized)
+# Written by `concat_and_cache_mla` with kv_cache_dtype="fp8_ds_mla".
+DS_MLA_ENTRY_BYTES = 656

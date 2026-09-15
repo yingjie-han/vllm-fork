@@ -853,14 +853,14 @@ def test_concat_and_cache_ds_mla(
             tile_end = (tile_idx + 1) * 128
             tile_data[:] = kv_c_data[tile_start:tile_end]
 
-            # tile_scale = tile_data.amax().to(torch.float32) / 448.
+            # tile_scale = tile_data.amax().to(torch.float32) / 224.
             # NOTE: Using torch's amax() gives different results,
             # so this must be manually computed.
             tile_data_float = tile_data.to(torch.float32)
             manual_max = abs(tile_data_float[0])
             for j in range(1, 128):
                 manual_max = max(manual_max, abs(tile_data_float[j]))
-            tile_scale = manual_max / 448.0
+            tile_scale = manual_max / 224.0
 
             ref_cache_32bit[kv_lora_rank // 4 + tile_idx] = tile_scale
 
