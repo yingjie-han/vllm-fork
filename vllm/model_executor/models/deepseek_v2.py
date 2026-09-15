@@ -774,30 +774,21 @@ class Indexer(nn.Module):
 
             return self.indexer_op(hidden_states, q_fp8, k, weights)
         else:
-            q_pe, q_nope = torch.split(
-                q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
-            )
             # Fused wk + weights_proj: one GEMM, then split
             kw, _ = self.wk_weights_proj(hidden_states)
             k = kw[:, : self.head_dim]
             weights = kw[:, self.head_dim :]
 
             k = self.k_norm(k)
-            k_pe, k_nope = torch.split(
-                k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
-            )
 
-            q_pe, k_pe = rotary_emb(positions, q_pe, k_pe.unsqueeze(1))
+            q_pe_dst = q[..., : self.rope_dim]
+            k_pe_dst = k[:, : self.rope_dim]
+            q_pe, k_pe = rotary_emb(positions, q_pe_dst, k_pe_dst.unsqueeze(1))
             # Note: RoPE (NeoX) can introduce extra leading dimensions during
             # compilation so we need to reshape back to token-flattened shapes
-            q_pe = q_pe.reshape(-1, self.n_head, self.rope_dim)
-            k_pe = k_pe.reshape(-1, self.rope_dim)
-
-            # `rotary_emb` is shape-preserving; `q_pe` is already
-            # [num_tokens, n_head, rope_dim].
-            q = torch.cat([q_pe, q_nope], dim=-1)
-            # `k_pe` is [num_tokens, rope_dim] (MQA).
-            k = torch.cat([k_pe, k_nope], dim=-1)
+            if not self.is_inplace_rope:
+                q_pe_dst.copy_(q_pe.reshape(q_pe_dst.shape))
+                k_pe_dst.copy_(k_pe.reshape(k_pe_dst.shape))
 
         # we only quant q here since k quant is fused with cache insertion
         q = q.view(-1, self.head_dim)
